@@ -58,6 +58,14 @@ VALID_LOG_LEVELS = {
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip() or "admin"
 
+# Shared password for the cloud Caddy → mediamtx playback proxy.
+# When unset, a placeholder password is written so mediamtx still loads;
+# playback auth simply won't succeed until the env var is set.
+MERLINREAD_PASSWORD = os.environ.get(
+    "MERLINREAD_PASSWORD",
+    "unset-set-MERLINREAD_PASSWORD-in-env",
+).strip()
+
 MEDIAMTX_API = "http://mediamtx:9997/v3/config"
 
 
@@ -151,6 +159,9 @@ def write_mediamtx_yml(cfg: dict) -> None:
         "rtspAddress: :8554\n"
         "rtspTransports: [tcp]\n"
         "\n"
+        "playback: yes\n"
+        "playbackAddress: :9996\n"
+        "\n"
         "webrtc: no\n"
         "hls: no\n"
         "rtmp: no\n"
@@ -158,23 +169,26 @@ def write_mediamtx_yml(cfg: dict) -> None:
         "\n"
         "authMethod: internal\n"
         "\n"
-        "# Default internal users:\n"
-        "#  - any client (no password) can publish/read/playback streams\n"
-        "#  - api/metrics/pprof reachable from loopback and the docker bridge\n"
-        "#    network (172.16.0.0/12) so the installer-ui sidecar can call the\n"
-        "#    mediamtx API to add/patch/delete paths on the fly.\n"
         "authInternalUsers:\n"
+        "  # Tailnet-internal: cloud's RTSP pull + edge supervisor publish.\n"
+        "  # 100.64.0.0/10 is the Tailscale CGNAT range — covers all tailnet IPs.\n"
         "  - user: any\n"
-        "    ips: []\n"
+        "    ips: [100.64.0.0/10, 172.16.0.0/12, 127.0.0.1, '::1']\n"
         "    permissions:\n"
         "      - action: publish\n"
         "      - action: read\n"
+        "\n"
+        "  # Public-facing playback: gated by the shared read credential\n"
+        "  # the Merlin web app passes via cloud Caddy for HLS / DVR.\n"
+        "  # Password from MERLINREAD_PASSWORD env var (set in .env).\n"
+        "  - user: merlinread\n"
+        f"    pass: {MERLINREAD_PASSWORD}\n"
+        "    permissions:\n"
         "      - action: playback\n"
+        "\n"
+        "  # API / metrics / pprof: loopback + Docker bridge only.\n"
         "  - user: any\n"
-        "    ips:\n"
-        "      - 127.0.0.1\n"
-        "      - '::1'\n"
-        "      - 172.16.0.0/12\n"
+        "    ips: [127.0.0.1, '::1', 172.16.0.0/12]\n"
         "    permissions:\n"
         "      - action: api\n"
         "      - action: metrics\n"

@@ -16,6 +16,7 @@ services:
     environment:
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
       ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
+      MERLINREAD_PASSWORD: "${MERLINREAD_PASSWORD:-}"
     volumes:
       - ./data:/data
       - /proc:/host/proc:ro
@@ -32,6 +33,7 @@ services:
       - installer-ui
     ports:
       - "8554:8554"           # RTSP — reachable by cloud over Tailscale
+      - "9996:9996"           # playback HTTP — reverse-proxied by cloud Caddy over Tailscale
       - "127.0.0.1:9997:9997" # API — local only
       - "127.0.0.1:9998:9998" # metrics — local only
     volumes:
