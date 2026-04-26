@@ -33,9 +33,10 @@ services:
       - installer-ui
     ports:
       - "8554:8554"           # RTSP — reachable by cloud over Tailscale
-      - "9996:9996"           # playback HTTP — reverse-proxied by cloud Caddy over Tailscale
       - "127.0.0.1:9997:9997" # API — local only
       - "127.0.0.1:9998:9998" # metrics — local only
+      # mediamtx playback (9996) is intentionally NOT exposed.
+      # The playback-shim service below sits in front of it on :9996.
     volumes:
       - ./data/mediamtx.yml:/mediamtx.yml:ro
       - ./data/recordings:/recordings
@@ -51,6 +52,21 @@ services:
       - mediamtx
     volumes:
       - ./data:/data
+    networks:
+      - edge
+    logging: *default-logging
+
+  playback-shim:
+    build:
+      context: ./playback-shim
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    ports:
+      - "9996:9996"           # public playback port — accepts ?user=&pass= from cloud Caddy,
+                              # forwards to mediamtx with Basic auth injected
+    environment:
+      UPSTREAM: "http://mediamtx:9996"
     networks:
       - edge
     logging: *default-logging
