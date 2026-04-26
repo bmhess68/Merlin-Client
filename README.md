@@ -285,3 +285,21 @@ hook for fleet-wide visibility.
   playback.
 - Cold-start latency (~3 s HLS / <1 s WebRTC) is acceptable for click-to-view.
 # Merlin-Client
+
+
+
+
+Pushed. A fresh box can now be installed with one line, no env vars required:
+
+
+curl -fsSL https://raw.githubusercontent.com/bmhess68/Merlin-Client/main/scripts/install.sh | sudo bash
+That clones to /opt/merlin-edge, runs bootstrap-box (Docker + Tailscale prompt + site-slug prompt), brings the stack up, and prints the box's tailnet IP/hostname.
+
+For non-interactive provisioning (e.g. burning many sites in a row, or PXE/cloud-init scenarios):
+
+
+curl -fsSL https://raw.githubusercontent.com/bmhess68/Merlin-Client/main/scripts/install.sh \
+  | sudo SITE_SLUG=school-main \
+         TAILSCALE_AUTH_KEY=tskey-auth-... \
+         bash
+Both variants will work for the second box you provision.

@@ -212,20 +212,25 @@ def _mediamtx_call(method: str, path: str, body: dict | None = None,
         return 0, str(exc)
 
 
-def sync_cloud_mediamtx_paths(cfg: dict) -> None:
+def sync_cloud_mediamtx_paths(cfg: dict) -> dict:
     """Push <site>-<slug> paths to the cloud's mediamtx via API. The box only
     owns paths prefixed with its own site slug; paths from other sites are
-    untouched. No-op if mediamtxApiUrl or tailnetHost isn't set."""
+    untouched. Returns a structured result for UI feedback."""
+    result: dict = {
+        "ok": False, "skipped": None, "added": [], "updated": [],
+        "deleted": [], "errors": [],
+    }
     cloud = cfg.get("cloud", {}) or {}
     api = cloud.get("mediamtxApiUrl", "").strip().rstrip("/")
     if not api:
-        return
+        result["skipped"] = "Cloud mediamtx API URL is not set in Site & Cloud."
+        return result
     base = f"{api}/v3/config"
     site_slug = cfg["site"]["slug"]
     tailnet_host = cloud.get("tailnetHost", "").strip()
     if not tailnet_host:
-        print("cloud sync skipped: tailnetHost not set", flush=True)
-        return
+        result["skipped"] = "Box's Tailscale hostname is not set in Site & Cloud."
+        return result
 
     desired: dict[str, dict] = {}
     for cam in cfg.get("cameras", []):
@@ -244,8 +249,8 @@ def sync_cloud_mediamtx_paths(cfg: dict) -> None:
 
     status, raw = _mediamtx_call("GET", "/paths/list", base=base)
     if status != 200:
-        print(f"cloud paths/list failed ({status}): {raw}", flush=True)
-        return
+        result["errors"].append(f"cloud GET /paths/list returned {status}: {raw[:200]}")
+        return result
     try:
         items = json.loads(raw).get("items", [])
     except json.JSONDecodeError:
@@ -257,19 +262,26 @@ def sync_cloud_mediamtx_paths(cfg: dict) -> None:
     for name, body in desired.items():
         if name in current:
             s, m = _mediamtx_call("PATCH", f"/paths/patch/{name}", body, base=base)
+            verb = "updated"
         else:
             s, m = _mediamtx_call("POST", f"/paths/add/{name}", body, base=base)
-        if s not in (200, 201):
-            print(f"cloud upsert {name} → {s}: {m}", flush=True)
+            verb = "added"
+        if s in (200, 201):
+            result[verb].append(name)
+        else:
+            result["errors"].append(f"{verb[:-1]} {name}: {s} {m[:120]}")
 
     for name in current:
-        if not name.startswith(site_prefix):
-            continue
-        if name in desired:
+        if not name.startswith(site_prefix) or name in desired:
             continue
         s, m = _mediamtx_call("DELETE", f"/paths/delete/{name}", base=base)
-        if s not in (200, 204):
-            print(f"cloud delete {name} → {s}: {m}", flush=True)
+        if s in (200, 204):
+            result["deleted"].append(name)
+        else:
+            result["errors"].append(f"delete {name}: {s} {m[:120]}")
+
+    result["ok"] = not result["errors"]
+    return result
 
 
 def sync_mediamtx_paths(cfg: dict) -> None:
@@ -330,12 +342,22 @@ def _strip_scheme(value: str) -> str:
     return v.rstrip("/")
 
 
+def _ensure_url(value: str) -> str:
+    """Auto-prepend http:// when a host-only value was pasted."""
+    v = value.strip().rstrip("/")
+    if not v:
+        return ""
+    if not (v.lower().startswith("http://") or v.lower().startswith("https://")):
+        v = "http://" + v
+    return v
+
+
 def validate_cloud(payload: dict) -> dict:
     return {
         "tailnetHost": _strip_scheme(str(payload.get("tailnetHost", ""))),
         "playbackHost": _strip_scheme(str(payload.get("playbackHost", ""))),
-        "healthUrl": str(payload.get("healthUrl", "")).strip(),
-        "mediamtxApiUrl": str(payload.get("mediamtxApiUrl", "")).strip().rstrip("/"),
+        "healthUrl": _ensure_url(str(payload.get("healthUrl", ""))),
+        "mediamtxApiUrl": _ensure_url(str(payload.get("mediamtxApiUrl", ""))),
     }
 
 
@@ -771,6 +793,14 @@ def api_snapshot(slug: str):
                     headers={"Cache-Control": "no-cache"})
 
 
+@app.post("/api/cloud-sync")
+@auth_required
+def api_cloud_sync():
+    """Manually push the current cameras config to the cloud mediamtx and
+    return a structured report. Same logic that runs on every save_config()."""
+    return jsonify(sync_cloud_mediamtx_paths(load_config()))
+
+
 @app.get("/api/cloud-config")
 @auth_required
 def api_cloud_config():
@@ -973,11 +1003,14 @@ INDEX_HTML = """<!doctype html>
             <div class="full"><label>Cloud mediamtx API URL (auto-syncs paths)</label>
               <input name="mediamtxApiUrl" id="cloud-api" placeholder="http://merlin-cloud:9997">
             </div>
-            <div class="full actions"><button type="submit">Save cloud</button></div>
+            <div class="full actions">
+              <button type="submit">Save cloud</button>
+              <button type="button" class="ghost" id="cloud-sync-btn">Sync cloud now</button>
+            </div>
           </form>
           <div id="cloud-msg"></div>
           <p class="small" style="margin-top:10px">Tailscale hostname tells the cloud where to pull from. Find it with <code class="mono">tailscale status --self</code> or in the Tailscale admin.</p>
-          <p class="small">Mediamtx API URL: when set, this box auto-pushes its <code>&lt;site&gt;-&lt;slug&gt;</code> paths to the cloud's mediamtx on every save. Cloud's mediamtx must allow API from tailnet (see docs).</p>
+          <p class="small">Mediamtx API URL: when set, this box auto-pushes its <code>&lt;site&gt;-&lt;slug&gt;</code> paths to the cloud's mediamtx on every save. Cloud's mediamtx must allow API from tailnet (see docs). The <strong>Sync cloud now</strong> button re-runs the same push and reports exactly what happened.</p>
         </div>
 
         <div class="card">
@@ -1142,6 +1175,26 @@ INDEX_HTML = """<!doctype html>
       const data = Object.fromEntries(new FormData(e.target).entries());
       try { await api('PUT', '/api/cloud', data); showMsg('#cloud-msg', 'Saved.'); refresh(); }
       catch (err) { showMsg('#cloud-msg', err.message, true); }
+    });
+
+    $('#cloud-sync-btn').addEventListener('click', async () => {
+      try {
+        const r = await api('POST', '/api/cloud-sync');
+        if (r.skipped) {
+          showMsg('#cloud-msg', 'Skipped: ' + r.skipped, true);
+          return;
+        }
+        if (!r.ok) {
+          const errs = (r.errors || []).join('; ');
+          showMsg('#cloud-msg', 'Cloud sync errors: ' + errs, true);
+          return;
+        }
+        const parts = [];
+        if (r.added.length)   parts.push(r.added.length   + ' added (' + r.added.join(', ') + ')');
+        if (r.updated.length) parts.push(r.updated.length + ' updated');
+        if (r.deleted.length) parts.push(r.deleted.length + ' deleted (' + r.deleted.join(', ') + ')');
+        showMsg('#cloud-msg', 'Cloud sync OK · ' + (parts.join(', ') || 'no changes'));
+      } catch (err) { showMsg('#cloud-msg', err.message, true); }
     });
 
     $('#add-form').addEventListener('submit', async (e) => {
