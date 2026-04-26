@@ -14,6 +14,12 @@ from pathlib import Path
 
 from flask import Flask, Response, jsonify, request
 
+try:
+    import docker  # docker SDK; mount /var/run/docker.sock to use
+    _docker_client = docker.from_env()
+except Exception:  # noqa: BLE001
+    _docker_client = None
+
 app = Flask(__name__)
 
 DATA_DIR = Path("/data")
@@ -604,6 +610,177 @@ def recordings_summary() -> dict:
     return {"totalBytes": total, "perCamera": per_cam}
 
 
+# --- compose service inspection + log tail ----------------------------------
+
+COMPOSE_PROJECT = "merlin-edge"
+SERVICES = ("installer-ui", "mediamtx", "relay")
+
+# Match credentials in URLs and replace the password part.
+# rtsp://user:pass@host  →  rtsp://user:****@host
+_CRED_RE = re.compile(r"(rtsps?://)([^:/@\s]+):([^@\s]+)@", re.IGNORECASE)
+
+
+def redact(line: str) -> str:
+    return _CRED_RE.sub(r"\1\2:****@", line)
+
+
+def list_services() -> list[dict]:
+    if _docker_client is None:
+        return [{"name": s, "state": "unknown", "error": "docker socket not available"} for s in SERVICES]
+    try:
+        cs = _docker_client.containers.list(
+            all=True,
+            filters={"label": f"com.docker.compose.project={COMPOSE_PROJECT}"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return [{"name": s, "state": "unknown", "error": str(exc)} for s in SERVICES]
+
+    by_service = {c.labels.get("com.docker.compose.service"): c for c in cs}
+    out = []
+    for svc in SERVICES:
+        c = by_service.get(svc)
+        if c is None:
+            out.append({"name": svc, "state": "missing"})
+            continue
+        try:
+            attrs = c.attrs
+            state = attrs.get("State", {}).get("Status", c.status)
+            started_at = attrs.get("State", {}).get("StartedAt", "")
+            restarting = attrs.get("State", {}).get("Restarting", False)
+            restart_count = attrs.get("RestartCount", 0)
+            out.append({
+                "name": svc,
+                "container": c.name,
+                "state": state,
+                "restarting": restarting,
+                "restartCount": restart_count,
+                "startedAt": started_at,
+            })
+        except Exception as exc:  # noqa: BLE001
+            out.append({"name": svc, "state": "unknown", "error": str(exc)})
+    return out
+
+
+def tail_logs(service: str, n: int = 200) -> list[str]:
+    if service not in SERVICES:
+        return [f"unknown service: {service}"]
+    if _docker_client is None:
+        return ["docker socket not available — installer-ui can't read container logs"]
+    try:
+        cs = _docker_client.containers.list(
+            all=True,
+            filters={
+                "label": [
+                    f"com.docker.compose.project={COMPOSE_PROJECT}",
+                    f"com.docker.compose.service={service}",
+                ],
+            },
+        )
+        if not cs:
+            return [f"no container found for service '{service}'"]
+        c = cs[0]
+        raw = c.logs(tail=n, timestamps=False)
+        if isinstance(raw, bytes):
+            text = raw.decode("utf-8", errors="replace")
+        else:
+            text = str(raw)
+        return [redact(line) for line in text.splitlines()]
+    except Exception as exc:  # noqa: BLE001
+        return [f"log read failed: {exc}"]
+
+
+# --- cloud connectivity test -------------------------------------------------
+
+def cloud_test(cfg: dict) -> dict:
+    cloud = cfg.get("cloud", {}) or {}
+    checks = []
+
+    api = cloud.get("mediamtxApiUrl", "").strip().rstrip("/")
+    if not api:
+        checks.append({
+            "name": "Cloud mediamtx API URL",
+            "ok": False,
+            "message": "Not set. Add it in Site & Cloud and Save.",
+        })
+    else:
+        s, raw = _mediamtx_call("GET", "/paths/list", base=f"{api}/v3/config")
+        if s == 200:
+            try:
+                count = len(json.loads(raw).get("items", []))
+            except json.JSONDecodeError:
+                count = 0
+            checks.append({
+                "name": f"Cloud mediamtx API ({api})",
+                "ok": True,
+                "message": f"reachable, {count} paths configured on cloud",
+            })
+        elif s in (401, 403):
+            checks.append({
+                "name": f"Cloud mediamtx API ({api})",
+                "ok": False,
+                "message": f"auth denied (HTTP {s}). Cloud's authInternalUsers must allow CGNAT (100.64.0.0/10) for action: api",
+            })
+        elif s == 0:
+            checks.append({
+                "name": f"Cloud mediamtx API ({api})",
+                "ok": False,
+                "message": f"cannot connect: {raw[:160]}. Try the cloud's tailnet IP instead of the name; check DNS in container",
+            })
+        else:
+            checks.append({
+                "name": f"Cloud mediamtx API ({api})",
+                "ok": False,
+                "message": f"HTTP {s}: {raw[:160]}",
+            })
+
+    health = cloud.get("healthUrl", "").strip()
+    if not health:
+        checks.append({
+            "name": "Cloud health URL",
+            "ok": True,
+            "message": "not configured (optional — leave empty if you don't have a receiver yet)",
+        })
+    else:
+        try:
+            req = urllib.request.Request(health, method="HEAD")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                checks.append({
+                    "name": f"Cloud health URL ({health})",
+                    "ok": True,
+                    "message": f"reachable (HTTP {r.status})",
+                })
+        except urllib.error.HTTPError as e:
+            # 404/405 etc still means we reached the host
+            checks.append({
+                "name": f"Cloud health URL ({health})",
+                "ok": True,
+                "message": f"reachable (HTTP {e.code} — endpoint may not be implemented yet, but the host responded)",
+            })
+        except (urllib.error.URLError, OSError) as e:
+            checks.append({
+                "name": f"Cloud health URL ({health})",
+                "ok": False,
+                "message": f"cannot reach: {e}",
+            })
+
+    tailnet_host = cloud.get("tailnetHost", "").strip()
+    if not tailnet_host:
+        checks.append({
+            "name": "Box's Tailscale hostname",
+            "ok": False,
+            "message": "Not set — cloud paths emitted with placeholder. Run `tailscale status --self --json` and paste DNSName.",
+        })
+    else:
+        checks.append({
+            "name": "Box's Tailscale hostname",
+            "ok": True,
+            "message": tailnet_host,
+        })
+
+    overall_ok = all(c["ok"] for c in checks)
+    return {"ok": overall_ok, "checks": checks}
+
+
 # --- cloud health POST (background) ------------------------------------------
 
 def _cloud_health_loop() -> None:
@@ -793,6 +970,29 @@ def api_snapshot(slug: str):
                     headers={"Cache-Control": "no-cache"})
 
 
+@app.get("/api/services")
+@auth_required
+def api_services():
+    return jsonify({"services": list_services()})
+
+
+@app.get("/api/logs/<service>")
+@auth_required
+def api_logs(service: str):
+    try:
+        n = int(request.args.get("tail", 200))
+    except (TypeError, ValueError):
+        n = 200
+    n = max(20, min(2000, n))
+    return jsonify({"service": service, "lines": tail_logs(service, n=n)})
+
+
+@app.post("/api/cloud-test")
+@auth_required
+def api_cloud_test():
+    return jsonify(cloud_test(load_config()))
+
+
 @app.post("/api/cloud-sync")
 @auth_required
 def api_cloud_sync():
@@ -881,12 +1081,19 @@ INDEX_HTML = """<!doctype html>
     .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex;
                 align-items: center; justify-content: center; z-index: 101; padding: 20px; cursor: pointer; }
     .lightbox img { max-width: 95vw; max-height: 95vh; border-radius: 8px; }
+    .services-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 16px; }
+    .logbox { max-height: 360px; overflow-y: auto; background: #15231a; color: #d6e6dc;
+              padding: 12px; border-radius: 10px; font: 11px/1.45 "SF Mono", Consolas, monospace;
+              white-space: pre-wrap; word-break: break-all; }
+    .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+    .toolbar select, .toolbar input[type=number] { width: auto; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>Merlin Edge Installer</h1>
     <p>Box-local cameras → MediaMTX (records + serves on demand) → cloud pulls over Tailscale when a Merlin user opens a camera.</p>
+    <div class="services-row" id="services"></div>
 
     <div id="edit-overlay" class="modal-overlay" hidden>
       <div class="modal">
@@ -1006,6 +1213,7 @@ INDEX_HTML = """<!doctype html>
             <div class="full actions">
               <button type="submit">Save cloud</button>
               <button type="button" class="ghost" id="cloud-sync-btn">Sync cloud now</button>
+              <button type="button" class="ghost" id="cloud-test-btn">Test cloud</button>
             </div>
           </form>
           <div id="cloud-msg"></div>
@@ -1018,6 +1226,22 @@ INDEX_HTML = """<!doctype html>
           <div id="host"></div>
         </div>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>Logs</h2>
+      <div class="toolbar">
+        <select id="logs-service">
+          <option value="relay">relay (camera ingest)</option>
+          <option value="mediamtx">mediamtx</option>
+          <option value="installer-ui">installer-ui</option>
+        </select>
+        <label>Lines: <input type="number" id="logs-tail" value="200" min="20" max="2000" step="20"></label>
+        <label><input type="checkbox" id="logs-auto" checked> Auto-refresh (3s)</label>
+        <button class="ghost" id="logs-refresh">Refresh now</button>
+        <span class="small">Camera URL passwords are masked. Stream tokens are visible — keep this UI behind Tailscale.</span>
+      </div>
+      <div class="logbox" id="logs-output">…</div>
     </div>
   </div>
 
@@ -1177,6 +1401,16 @@ INDEX_HTML = """<!doctype html>
       catch (err) { showMsg('#cloud-msg', err.message, true); }
     });
 
+    $('#cloud-test-btn').addEventListener('click', async () => {
+      try {
+        const r = await api('POST', '/api/cloud-test');
+        const lines = r.checks.map(c => (c.ok ? '✓' : '✗') + ' ' + c.name + ' — ' + c.message);
+        const html = lines.map(l => '<div class="small mono">'+l+'</div>').join('');
+        document.querySelector('#cloud-msg').innerHTML =
+          '<div class="toast '+(r.ok?'':'err')+'">'+(r.ok?'All cloud checks passed':'Some cloud checks failed')+'<div style="margin-top:6px">'+html+'</div></div>';
+      } catch (err) { showMsg('#cloud-msg', err.message, true); }
+    });
+
     $('#cloud-sync-btn').addEventListener('click', async () => {
       try {
         const r = await api('POST', '/api/cloud-sync');
@@ -1293,8 +1527,49 @@ INDEX_HTML = """<!doctype html>
       document.execCommand('copy');
     });
 
+    function renderServices(services) {
+      const el = $('#services');
+      const cls = (s) => s.state === 'running' && !s.restarting ? 'ok'
+                      : s.state === 'restarting' || s.restarting ? 'warn'
+                      : s.state === 'exited' || s.state === 'missing' ? 'bad'
+                      : 'off';
+      el.innerHTML = services.map(s => {
+        const restarts = (s.restartCount && s.restartCount > 0) ? ' ↻' + s.restartCount : '';
+        return '<span class="pill '+cls(s)+'">'+s.name+': '+(s.state||'?')+restarts+'</span>';
+      }).join('');
+    }
+
+    async function refreshServices() {
+      try {
+        const r = await api('GET', '/api/services');
+        renderServices(r.services);
+      } catch (err) { /* silent */ }
+    }
+
+    async function refreshLogs() {
+      try {
+        const svc = $('#logs-service').value;
+        const tail = $('#logs-tail').value || 200;
+        const r = await api('GET', '/api/logs/' + svc + '?tail=' + tail);
+        const box = $('#logs-output');
+        const wasAtBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+        box.textContent = r.lines.join('\n') || '(no log lines)';
+        if (wasAtBottom) box.scrollTop = box.scrollHeight;
+      } catch (err) {
+        $('#logs-output').textContent = 'log fetch failed: ' + err.message;
+      }
+    }
+
+    $('#logs-refresh').addEventListener('click', refreshLogs);
+    $('#logs-service').addEventListener('change', refreshLogs);
+    $('#logs-tail').addEventListener('change', refreshLogs);
+
     refresh();
+    refreshServices();
+    refreshLogs();
     setInterval(refresh, 5000);
+    setInterval(refreshServices, 5000);
+    setInterval(() => { if ($('#logs-auto').checked) refreshLogs(); }, 3000);
   </script>
 </body>
 </html>"""
