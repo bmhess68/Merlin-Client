@@ -1,0 +1,56 @@
+name: merlin-edge
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  installer-ui:
+    build:
+      context: ./web-ui
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
+    volumes:
+      - ./data:/data
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    networks:
+      - edge
+    logging: *default-logging
+
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    restart: unless-stopped
+    depends_on:
+      - installer-ui
+    ports:
+      - "8554:8554"           # RTSP — reachable by cloud over Tailscale
+      - "127.0.0.1:9997:9997" # API — local only
+      - "127.0.0.1:9998:9998" # metrics — local only
+    volumes:
+      - ./data/mediamtx.yml:/mediamtx.yml:ro
+      - ./data/recordings:/recordings
+    networks:
+      - edge
+    logging: *default-logging
+
+  relay:
+    build:
+      context: ./relay
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    volumes:
+      - ./data:/data
+    networks:
+      - edge
+    logging: *default-logging
+
+networks:
+  edge:
