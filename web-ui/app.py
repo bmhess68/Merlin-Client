@@ -1553,7 +1553,7 @@ INDEX_HTML = """<!doctype html>
         const r = await api('GET', '/api/logs/' + svc + '?tail=' + tail);
         const box = $('#logs-output');
         const wasAtBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
-        box.textContent = r.lines.join('\n') || '(no log lines)';
+        box.textContent = r.lines.join('\\n') || '(no log lines)';
         if (wasAtBottom) box.scrollTop = box.scrollHeight;
       } catch (err) {
         $('#logs-output').textContent = 'log fetch failed: ' + err.message;
