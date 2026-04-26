@@ -14,7 +14,7 @@
 #   TAILSCALE_AUTH_KEY  if set, bootstrap joins the tailnet non-interactively
 set -euo pipefail
 
-REPO_DEFAULT=""   # TODO: set this once the repo is pushed (e.g. https://github.com/<org>/videoclient.git)
+REPO_DEFAULT="https://github.com/bmhess68/Merlin-Client.git"
 REPO="${MERLIN_REPO:-${REPO_DEFAULT}}"
 BRANCH="${MERLIN_BRANCH:-main}"
 TARGET="${MERLIN_DIR:-/opt/merlin-edge}"
