@@ -265,6 +265,9 @@ def sync_cloud_mediamtx_paths(cfg: dict) -> dict:
             "sourceOnDemand": True,
             "sourceOnDemandStartTimeout": "15s",
             "sourceOnDemandCloseAfter": "30s",
+            # Box's mediamtx is rtspTransports: [tcp] — pin the puller to TCP
+            # so the cloud doesn't try UDP first and get RTSP 400 from the box.
+            "rtspTransport": "tcp",
         }
 
     status, raw = _mediamtx_call("GET", "/paths/list", base=base)
@@ -476,7 +479,14 @@ def supervisor_status() -> dict:
 
 def cloud_paths_yaml(cfg: dict) -> str:
     """Emit a copy-paste mediamtx paths block for the cloud server,
-    one path per camera on this box."""
+    one path per camera on this box.
+
+    `rtspTransport: tcp` is required because the box's mediamtx is
+    configured with `rtspTransports: [tcp]`. Without it, the cloud's
+    puller falls back to `automatic`, attempts UDP first, the box
+    returns RTSP 400 Bad Request, and the cloud gives up that pull
+    cycle. Diagnosed 2026-04-29.
+    """
     site_slug = cfg["site"]["slug"]
     tailnet_host = cfg.get("cloud", {}).get("tailnetHost", "").strip() or f"<{site_slug}-tailnet-host>"
     lines = ["paths:"]
@@ -489,6 +499,7 @@ def cloud_paths_yaml(cfg: dict) -> str:
         lines.append(f"    sourceOnDemand: yes")
         lines.append(f"    sourceOnDemandStartTimeout: 15s")
         lines.append(f"    sourceOnDemandCloseAfter: 30s")
+        lines.append(f"    rtspTransport: tcp")
     return "\n".join(lines) + "\n"
 
 
