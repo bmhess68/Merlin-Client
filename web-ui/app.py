@@ -385,9 +385,10 @@ def validate_defaults(payload: dict) -> dict:
     transport = str(payload.get("rtspTransport", "tcp")).lower()
     if transport not in VALID_TRANSPORTS:
         raise ValueError("rtspTransport must be tcp or udp")
-    log_level = str(payload.get("logLevel", "warning")).lower()
+    log_level_raw = payload.get("logLevel") or "warning"
+    log_level = str(log_level_raw).lower()
     if log_level not in VALID_LOG_LEVELS:
-        raise ValueError("logLevel is invalid")
+        raise ValueError(f"logLevel '{log_level}' is invalid (allowed: {', '.join(sorted(VALID_LOG_LEVELS))})")
     try:
         retain_hours = int(payload.get("retainHours", 168))
     except (TypeError, ValueError) as exc:
@@ -415,9 +416,13 @@ def validate_camera(payload: dict, conflicting_slugs: set[str]) -> dict:
     transport = str(payload.get("rtspTransport", "tcp")).lower()
     if transport not in VALID_TRANSPORTS:
         raise ValueError("rtspTransport must be tcp or udp")
-    log_level = str(payload.get("logLevel", "")).lower()
-    if log_level and log_level not in VALID_LOG_LEVELS:
-        raise ValueError("logLevel is invalid")
+    log_level_raw = payload.get("logLevel")
+    if log_level_raw in (None, ""):
+        log_level = ""
+    else:
+        log_level = str(log_level_raw).lower()
+        if log_level not in VALID_LOG_LEVELS:
+            raise ValueError(f"logLevel '{log_level}' is invalid (allowed: {', '.join(sorted(VALID_LOG_LEVELS))})")
     try:
         retain_hours = int(payload.get("retainHours", 168))
     except (TypeError, ValueError) as exc:
