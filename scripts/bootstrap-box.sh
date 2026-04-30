@@ -121,6 +121,16 @@ echo "  - Tailnet IP:  ${ts_ip:-not joined}"
 if [[ -n "${ts_dns}" ]]; then
   echo "  - Tailnet DNS: ${ts_dns} (informational; use the IP in the box UI)"
 fi
+
+# Persist the tailnet IP so the installer-ui can auto-fill the
+# "Box's tailnet address" field. Re-run this script any time Tailscale
+# rejoins / changes IP to refresh.
+if [[ -n "${ts_ip}" ]]; then
+  install -d -m 0755 -o "${SUDO_USER:-root}" -g "${SUDO_USER:-root}" "${repo_root}/data" 2>/dev/null || mkdir -p "${repo_root}/data"
+  printf '%s\n' "${ts_ip}" > "${repo_root}/data/tailnet-ip.txt"
+  chown "${SUDO_USER:-root}":"${SUDO_USER:-root}" "${repo_root}/data/tailnet-ip.txt" 2>/dev/null || true
+  echo "  - Wrote ${repo_root}/data/tailnet-ip.txt for installer-ui auto-fill"
+fi
 echo
 echo "Next:"
 echo "  cd ${repo_root}"

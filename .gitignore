@@ -12,6 +12,7 @@ data/mediamtx.yml
 data/runtime.env
 data/recordings/
 data/thumbnails/
+data/tailnet-ip.txt
 
 # Python
 __pycache__/

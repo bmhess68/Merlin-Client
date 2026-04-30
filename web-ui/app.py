@@ -28,6 +28,7 @@ STATUS_PATH = DATA_DIR / "status.json"
 MEDIAMTX_PATH = DATA_DIR / "mediamtx.yml"
 RECORDINGS_ROOT = DATA_DIR / "recordings"
 THUMBNAILS_ROOT = DATA_DIR / "thumbnails"
+TAILNET_IP_FILE = DATA_DIR / "tailnet-ip.txt"
 
 HOST_PROC = Path("/host/proc")
 
@@ -1032,6 +1033,21 @@ def api_health():
     return jsonify(build_health(cfg))
 
 
+@app.get("/api/tailnet-ip")
+@auth_required
+def api_tailnet_ip():
+    """Return the box's own tailnet IP, written by bootstrap-box.sh after
+    `tailscale up` succeeds. Used by the UI to auto-fill the
+    `cloud.tailnetHost` field. Empty string if the file isn't there
+    (bootstrap not yet run, or Tailscale not joined)."""
+    ip = ""
+    try:
+        ip = TAILNET_IP_FILE.read_text().strip().splitlines()[0] if TAILNET_IP_FILE.exists() else ""
+    except (OSError, IndexError):
+        ip = ""
+    return jsonify({"ip": ip})
+
+
 @app.get("/api/snapshot/<slug>.jpg")
 @auth_required
 def api_snapshot(slug: str):
@@ -1276,6 +1292,7 @@ INDEX_HTML = """<!doctype html>
           <form id="cloud-form" class="row">
             <div class="full"><label>Box's tailnet address (use the IP, not the MagicDNS name)</label>
               <input name="tailnetHost" id="cloud-tailnet" placeholder="100.86.38.62">
+              <button type="button" class="ghost" id="use-box-ip" hidden style="margin-top:6px;font-size:12px;padding:4px 10px">Use this box's tailnet IP</button>
             </div>
             <div class="full"><label>Cloud playback hostname (informational)</label>
               <input name="playbackHost" id="cloud-playback" placeholder="147.182.179.39 or merlin-cloud">
@@ -1443,6 +1460,25 @@ INDEX_HTML = """<!doctype html>
       if (el && document.activeElement !== el) el.value = value;
     }
 
+    let _boxTailnetIp = null;
+    async function loadBoxTailnetIp() {
+      try {
+        const r = await api('GET', '/api/tailnet-ip');
+        _boxTailnetIp = (r.ip || '').trim();
+        const btn = $('#use-box-ip');
+        if (_boxTailnetIp) {
+          btn.textContent = "Use this box's IP (" + _boxTailnetIp + ")";
+          btn.hidden = false;
+          $('#cloud-tailnet').placeholder = _boxTailnetIp;
+        } else {
+          btn.hidden = true;
+        }
+      } catch (e) { /* silent */ }
+    }
+    $('#use-box-ip').addEventListener('click', () => {
+      if (_boxTailnetIp) $('#cloud-tailnet').value = _boxTailnetIp;
+    });
+
     async function refresh() {
       const cfg = await api('GET', '/api/config');
       const health = await api('GET', '/api/health');
@@ -1453,7 +1489,14 @@ INDEX_HTML = """<!doctype html>
 
       setIfNotFocused('site-slug', cfg.config.site.slug);
       setIfNotFocused('site-display', cfg.config.site.displayName);
-      setIfNotFocused('cloud-tailnet', cfg.config.cloud.tailnetHost || '');
+      // Auto-fill the box's tailnet IP if the field is currently empty
+      // (initial setup — saves the tech a copy/paste).
+      const stored = cfg.config.cloud.tailnetHost || '';
+      if (!stored && _boxTailnetIp && document.activeElement !== $('#cloud-tailnet')) {
+        $('#cloud-tailnet').value = _boxTailnetIp;
+      } else {
+        setIfNotFocused('cloud-tailnet', stored);
+      }
       setIfNotFocused('cloud-playback', cfg.config.cloud.playbackHost || '');
       setIfNotFocused('cloud-health', cfg.config.cloud.healthUrl || '');
       setIfNotFocused('cloud-admin-api', cfg.config.cloud.adminApiUrl || '');
@@ -1639,7 +1682,7 @@ INDEX_HTML = """<!doctype html>
     $('#logs-service').addEventListener('change', refreshLogs);
     $('#logs-tail').addEventListener('change', refreshLogs);
 
-    refresh();
+    loadBoxTailnetIp().then(refresh);
     refreshServices();
     refreshLogs();
     setInterval(refresh, 5000);
