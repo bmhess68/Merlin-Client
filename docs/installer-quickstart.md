@@ -92,15 +92,24 @@ You'll see three pills at the top — `installer-ui: running`, `mediamtx: runnin
 
 ### 6. Configure Site & Cloud (right column)
 
-Three fields. Copy carefully.
+Use **IP addresses, not Tailscale MagicDNS names**, for any tailnet host. The
+cloud server's mediamtx runs in a Docker container that doesn't always
+resolve Tailscale DNS; IPs are stable and reliable.
 
-- **Site slug**: the same slug you used in the install command (e.g. `riverside-gym`). Click **Save site**.
-- **Box's Tailscale hostname**: the **Tailnet DNS** the install printed (e.g. `riverside-gym.tail7e85.ts.net`).
-- **Cloud playback hostname**: `merlin-cloud` (or whatever the dispatcher specifies).
-- **Cloud mediamtx API URL**: `http://100.112.231.52:9997` — this is the cloud server's tailnet IP. Get it from the dispatcher; don't guess.
-- **Cloud health URL**: leave blank unless dispatcher specifies.
+- **Site slug**: same slug you used in the install command (e.g. `riverside-gym`). Click **Save site**.
+- **Box's tailnet address**: the **Tailnet IP** the install printed (e.g. `100.86.38.62`). NOT the MagicDNS name.
+- **Cloud playback hostname**: the cloud's public IP or DNS name as supplied by the dispatcher (e.g. `147.182.179.39`).
+- **Cloud admin API URL**: `http://<cloud-tailnet-ip>/api/v1/admin/cloud-pull-cameras` — the dispatcher gives you the cloud's tailnet IP.
+- **Cloud health URL**: `http://<cloud-tailnet-ip>/edge-health` (optional; if dispatcher hasn't set up the receiver, leave blank).
 
-Click **Save cloud**. Then click **Test cloud** — every check should be ✓ green. If any are ✗, **stop and call your dispatcher** before adding cameras.
+You also need the **`CONTROL_API_KEY`** the dispatcher supplied. Add it to the box's `.env`:
+
+```bash
+echo 'CONTROL_API_KEY=<paste-the-key>' | sudo tee -a /opt/merlin-edge/.env
+sudo docker compose -f /opt/merlin-edge/compose.yaml up -d --build installer-ui
+```
+
+Then click **Save cloud**, then **Test cloud** — every check should be ✓ green. If any are ✗, **stop and call your dispatcher** before adding cameras.
 
 ### 7. Add cameras
 

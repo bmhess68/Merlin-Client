@@ -115,18 +115,26 @@ echo
 echo "Bootstrap complete."
 echo "  - Docker:    $(docker --version 2>/dev/null || echo 'not on PATH yet (re-login)')"
 echo "  - Compose:   $(docker compose version 2>/dev/null || echo 'not on PATH yet')"
-echo "  - Tailscale: $(tailscale ip -4 2>/dev/null | head -n1 || echo 'not joined')"
+ts_ip="$(tailscale ip -4 2>/dev/null | head -n1 || echo '')"
 ts_dns="$(tailscale status --self --json 2>/dev/null | jq -r '.Self.DNSName // ""' 2>/dev/null | sed 's/\.$//' || true)"
+echo "  - Tailnet IP:  ${ts_ip:-not joined}"
 if [[ -n "${ts_dns}" ]]; then
-  echo "  - Tailnet DNS: ${ts_dns}"
+  echo "  - Tailnet DNS: ${ts_dns} (informational; use the IP in the box UI)"
 fi
 echo
 echo "Next:"
 echo "  cd ${repo_root}"
 echo "  docker compose up -d --build"
-echo "  open http://<box-ip>:8080  (or via Tailscale at the assigned hostname)"
+echo "  open http://<lan-ip>:8080  in a browser on the same LAN"
 echo
-if [[ -n "${ts_dns}" ]]; then
-  echo "Cloud-side mediamtx config (drop into the cloud's mediamtx.yml):"
-  echo "  source: rtsp://${ts_dns}:8554/<camera-slug>"
+echo "In the box UI's Site & Cloud card, paste these:"
+echo "  Box's tailnet address: ${ts_ip:-<rejoin tailnet first>}"
+echo "                         ^^^^^ use the IP, NOT the MagicDNS name."
+echo "                         The cloud's mediamtx container can't always"
+echo "                         resolve tailnet DNS; IPs are stable and reliable."
+if [[ -n "${ts_ip}" ]]; then
+  echo
+  echo "Cloud-side reference (informational — the cloud admin API generates"
+  echo "this automatically when the box registers):"
+  echo "  source: rtsp://${ts_ip}:8554/<camera-slug>"
 fi

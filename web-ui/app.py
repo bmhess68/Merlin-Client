@@ -1274,11 +1274,11 @@ INDEX_HTML = """<!doctype html>
           <div id="site-msg"></div>
           <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
           <form id="cloud-form" class="row">
-            <div class="full"><label>Box's Tailscale hostname</label>
-              <input name="tailnetHost" id="cloud-tailnet" placeholder="school-main.tail1234.ts.net">
+            <div class="full"><label>Box's tailnet address (use the IP, not the MagicDNS name)</label>
+              <input name="tailnetHost" id="cloud-tailnet" placeholder="100.86.38.62">
             </div>
             <div class="full"><label>Cloud playback hostname (informational)</label>
-              <input name="playbackHost" id="cloud-playback" placeholder="cloud.example.com">
+              <input name="playbackHost" id="cloud-playback" placeholder="147.182.179.39 or merlin-cloud">
             </div>
             <div class="full"><label>Cloud health URL (optional)</label>
               <input name="healthUrl" id="cloud-health" placeholder="https://cloud.example/api/edge-health">
@@ -1293,7 +1293,7 @@ INDEX_HTML = """<!doctype html>
             </div>
           </form>
           <div id="cloud-msg"></div>
-          <p class="small" style="margin-top:10px">Tailscale hostname tells the cloud which box to pull from. Find it with <code class="mono">tailscale status --self --json | jq -r '.Self.DNSName'</code>.</p>
+          <p class="small" style="margin-top:10px"><strong>Use the box's tailnet IP address</strong> — find it with <code class="mono">tailscale ip -4</code> on the box (e.g. <code class="mono">100.86.38.62</code>). Avoid the MagicDNS name (<code class="mono">*.tail*.ts.net</code>): the cloud's mediamtx runs in a Docker container whose embedded resolver doesn't always reach Tailscale's DNS, and the resulting "name does not resolve" failures are silent until a viewer can't load a camera.</p>
           <p class="small">Cloud admin API URL: this box POSTs its camera list to the cloud's <code>/api/v1/admin/cloud-pull-cameras</code> on every save. The cloud is master — it generates mediamtx paths from the registration. Requires <code>CONTROL_API_KEY</code> in the box's <code>.env</code>. <strong>Sync cloud now</strong> re-posts immediately; <strong>Test cloud</strong> probes the URL + auth without changing state.</p>
         </div>
 
