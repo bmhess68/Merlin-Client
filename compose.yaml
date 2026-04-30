@@ -17,6 +17,7 @@ services:
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
       ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
       MERLINREAD_PASSWORD: "${MERLINREAD_PASSWORD:-}"
+      CONTROL_API_KEY: "${CONTROL_API_KEY:-}"
     volumes:
       - ./data:/data
       - /proc:/host/proc:ro

@@ -1,0 +1,102 @@
+MerlinConnect Cloud API Handoff
+
+This cloud server is Tailscale-only.
+Use the cloud host's MagicDNS name or Tailscale IP for the MediaMTX API.
+Use the public IP or public DNS for browser HLS playback when browsers do not resolve the tailnet hostname.
+
+Required values
+
+Cloud host:
+  http://<cloud-tailnet-name>
+
+MediaMTX API:
+  http://<cloud-tailnet-name>:9997
+
+Browser HLS base:
+  http://<cloud-public-ip-or-dns>/live
+
+Control API key:
+  x-api-key: <control-api-key>
+
+Merlin Map MediaMTX credentials:
+  username: <MEDIAMTX_MAP_USER>
+  password: <MEDIAMTX_MAP_PASS>
+
+1. Register or update a site's camera list
+
+Each video-client PC should POST its current camera configuration to:
+
+  POST http://<cloud-tailnet-name>/api/v1/admin/cloud-pull-cameras
+
+Headers:
+  content-type: application/json
+  x-api-key: <control-api-key>
+
+Body:
+{
+  "site": "merlin-edge-jail",
+  "tailnetHost": "merlin-edge-jail.<tailnet>.ts.net",
+  "cameras": [
+    {
+      "slug": "front-door",
+      "label": "Jail Front Door"
+    },
+    {
+      "slug": "south-front-ptz",
+      "label": "Jail South Front PTZ"
+    },
+    {
+      "slug": "camera-lobby",
+      "label": "Jail Camera Lobby"
+    }
+  ]
+}
+
+Notes:
+- "site" should be the stable site slug for that box.
+- "tailnetHost" should be the MagicDNS name of that box.
+- "slug" should match the RTSP path served by the box on port 8554.
+- Re-post the full camera list for the site whenever cameras change.
+- The cloud server replaces the saved list for that site with the new payload.
+
+Successful response example:
+{
+  "site": "merlin-edge-jail",
+  "tailnetHost": "merlin-edge-jail.<tailnet>.ts.net",
+  "cameraCount": 3,
+  "streamPaths": [
+    "merlin-edge-jail-front-door",
+    "merlin-edge-jail-south-front-ptz",
+    "merlin-edge-jail-camera-lobby"
+  ]
+}
+
+2. Merlin Map camera discovery
+
+Merlin Map should read MediaMTX directly over Tailscale:
+
+  MEDIAMTX_API_URL=http://<cloud-tailnet-name>:9997
+  MEDIAMTX_API_USER=<MEDIAMTX_MAP_USER>
+  MEDIAMTX_API_PASS=<MEDIAMTX_MAP_PASS>
+  MEDIAMTX_HLS_URL=http://<cloud-public-ip-or-dns>/live
+
+Merlin Map can query MediaMTX endpoints such as:
+
+  GET http://<cloud-tailnet-name>:9997/v3/paths/list
+
+3. Playback URLs
+
+Camera playback URLs are:
+
+  http://<cloud-public-ip-or-dns>/live/<site>-<camera>/index.m3u8
+
+Example:
+
+  http://147.182.179.39/live/merlin-edge-jail-front-door/index.m3u8
+
+4. Important rules
+
+- Merlin Map and video-client PCs should be on the same Tailscale tailnet as the cloud host for API access.
+- Use MagicDNS names whenever possible instead of raw Tailscale IPs for the API.
+- Port 9997 is for direct MediaMTX API access over Tailscale.
+- Port 80 serves HLS playback and may use the public IP if browsers cannot resolve the Tailscale hostname.

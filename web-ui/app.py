@@ -38,7 +38,8 @@ DEFAULT_CONFIG = {
         "tailnetHost": "",
         "playbackHost": "",
         "healthUrl": "",
-        "mediamtxApiUrl": "",
+        "adminApiUrl": "",      # http://<cloud>/api/v1/admin/cloud-pull-cameras
+        "mediamtxApiUrl": "",   # legacy; unused by the new admin-API flow
     },
     "defaults": {
         "rtspTransport": "tcp",
@@ -65,6 +66,12 @@ MERLINREAD_PASSWORD = os.environ.get(
     "MERLINREAD_PASSWORD",
     "unset-set-MERLINREAD_PASSWORD-in-env",
 ).strip()
+
+# Control-plane API key for POSTing camera registrations to the cloud's
+# /api/v1/admin/cloud-pull-cameras endpoint. Cloud is master — it owns
+# mediamtx path generation. This key is sent as the `x-api-key` header.
+# Set in .env on this box; never written to git or config.json.
+CONTROL_API_KEY = os.environ.get("CONTROL_API_KEY", "").strip()
 
 MEDIAMTX_API = "http://mediamtx:9997/v3/config"
 
@@ -142,7 +149,7 @@ def save_config(cfg: dict, *, write_mediamtx: bool = True) -> None:
     if write_mediamtx:
         write_mediamtx_yml(cfg)
         sync_mediamtx_paths(cfg)
-        sync_cloud_mediamtx_paths(cfg)
+        register_cameras_with_cloud(cfg)
 
 
 def write_mediamtx_yml(cfg: dict) -> None:
@@ -232,78 +239,90 @@ def _mediamtx_call(method: str, path: str, body: dict | None = None,
         return 0, str(exc)
 
 
-def sync_cloud_mediamtx_paths(cfg: dict) -> dict:
-    """Push <site>-<slug> paths to the cloud's mediamtx via API. The box only
-    owns paths prefixed with its own site slug; paths from other sites are
-    untouched. Returns a structured result for UI feedback."""
+def register_cameras_with_cloud(cfg: dict) -> dict:
+    """POST the box's current camera list to the cloud's admin endpoint.
+    Cloud is master — it owns mediamtx path generation. Body shape:
+
+        { "site": "<slug>",
+          "tailnetHost": "<box>.<tailnet>.ts.net",
+          "cameras": [{"slug": "...", "label": "..."}, ...] }
+
+    Authenticated with `x-api-key: <CONTROL_API_KEY>`. Re-posting replaces
+    the cloud's saved camera list for this site.
+    """
     result: dict = {
-        "ok": False, "skipped": None, "added": [], "updated": [],
-        "deleted": [], "errors": [],
+        "ok": False, "skipped": None,
+        "registered": [], "cameraCount": 0, "errors": [],
     }
     cloud = cfg.get("cloud", {}) or {}
-    api = cloud.get("mediamtxApiUrl", "").strip().rstrip("/")
+    api = cloud.get("adminApiUrl", "").strip().rstrip("/")
     if not api:
-        result["skipped"] = "Cloud mediamtx API URL is not set in Site & Cloud."
+        result["skipped"] = "Cloud admin API URL is not set in Site & Cloud."
         return result
-    base = f"{api}/v3/config"
+    if not CONTROL_API_KEY:
+        result["skipped"] = (
+            "CONTROL_API_KEY env var is not set on the box. "
+            "Add to .env and restart the installer-ui container."
+        )
+        return result
     site_slug = cfg["site"]["slug"]
     tailnet_host = cloud.get("tailnetHost", "").strip()
     if not tailnet_host:
         result["skipped"] = "Box's Tailscale hostname is not set in Site & Cloud."
         return result
 
-    desired: dict[str, dict] = {}
+    cameras = []
     for cam in cfg.get("cameras", []):
         if not cam.get("enabled", True):
             continue
         slug = cam.get("slug")
         if not slug:
             continue
-        cloud_path = f"{site_slug}-{slug}"
-        desired[cloud_path] = {
-            "source": f"rtsp://{tailnet_host}:8554/{slug}",
-            "sourceOnDemand": True,
-            "sourceOnDemandStartTimeout": "15s",
-            "sourceOnDemandCloseAfter": "30s",
-            # Box's mediamtx is rtspTransports: [tcp] — pin the puller to TCP
-            # so the cloud doesn't try UDP first and get RTSP 400 from the box.
-            "rtspTransport": "tcp",
-        }
+        cameras.append({
+            "slug": slug,
+            "label": cam.get("displayName") or slug,
+        })
 
-    status, raw = _mediamtx_call("GET", "/paths/list", base=base)
-    if status != 200:
-        result["errors"].append(f"cloud GET /paths/list returned {status}: {raw[:200]}")
-        return result
+    body = {
+        "site": site_slug,
+        "tailnetHost": tailnet_host,
+        "cameras": cameras,
+    }
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        api,
+        data=data,
+        headers={
+            "content-type": "application/json",
+            "x-api-key": CONTROL_API_KEY,
+        },
+        method="POST",
+    )
     try:
-        items = json.loads(raw).get("items", [])
-    except json.JSONDecodeError:
-        items = []
-    current = {item.get("name"): item for item in items if item.get("name")}
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw)
+                result["registered"] = payload.get("streamPaths", [])
+                result["cameraCount"] = payload.get("cameraCount", len(cameras))
+                result["ok"] = True
+            except json.JSONDecodeError:
+                result["errors"].append(
+                    f"cloud accepted (HTTP {r.status}) but returned non-JSON body: {raw[:200]}"
+                )
+                # Treat 2xx as success even if body is unparseable
+                if 200 <= r.status < 300:
+                    result["ok"] = True
+                    result["cameraCount"] = len(cameras)
+    except urllib.error.HTTPError as exc:
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            err_body = ""
+        result["errors"].append(f"HTTP {exc.code}: {err_body[:200] or exc.reason}")
+    except (urllib.error.URLError, OSError) as exc:
+        result["errors"].append(f"cannot connect: {exc}")
 
-    site_prefix = f"{site_slug}-"
-
-    for name, body in desired.items():
-        if name in current:
-            s, m = _mediamtx_call("PATCH", f"/paths/patch/{name}", body, base=base)
-            verb = "updated"
-        else:
-            s, m = _mediamtx_call("POST", f"/paths/add/{name}", body, base=base)
-            verb = "added"
-        if s in (200, 201):
-            result[verb].append(name)
-        else:
-            result["errors"].append(f"{verb[:-1]} {name}: {s} {m[:120]}")
-
-    for name in current:
-        if not name.startswith(site_prefix) or name in desired:
-            continue
-        s, m = _mediamtx_call("DELETE", f"/paths/delete/{name}", base=base)
-        if s in (200, 204):
-            result["deleted"].append(name)
-        else:
-            result["errors"].append(f"delete {name}: {s} {m[:120]}")
-
-    result["ok"] = not result["errors"]
     return result
 
 
@@ -380,6 +399,7 @@ def validate_cloud(payload: dict) -> dict:
         "tailnetHost": _strip_scheme(str(payload.get("tailnetHost", ""))),
         "playbackHost": _strip_scheme(str(payload.get("playbackHost", ""))),
         "healthUrl": _ensure_url(str(payload.get("healthUrl", ""))),
+        "adminApiUrl": _ensure_url(str(payload.get("adminApiUrl", ""))),
         "mediamtxApiUrl": _ensure_url(str(payload.get("mediamtxApiUrl", ""))),
     }
 
@@ -725,42 +745,67 @@ def cloud_test(cfg: dict) -> dict:
     cloud = cfg.get("cloud", {}) or {}
     checks = []
 
-    api = cloud.get("mediamtxApiUrl", "").strip().rstrip("/")
+    api = cloud.get("adminApiUrl", "").strip()
     if not api:
         checks.append({
-            "name": "Cloud mediamtx API URL",
+            "name": "Cloud admin API URL",
             "ok": False,
-            "message": "Not set. Add it in Site & Cloud and Save.",
+            "message": "Not set. Add it in Site & Cloud and Save (e.g. http://merlin-cloud/api/v1/admin/cloud-pull-cameras).",
+        })
+    elif not CONTROL_API_KEY:
+        checks.append({
+            "name": "CONTROL_API_KEY env var",
+            "ok": False,
+            "message": "Not set. Add CONTROL_API_KEY=... to .env and `docker compose up -d --build installer-ui`.",
         })
     else:
-        s, raw = _mediamtx_call("GET", "/paths/list", base=f"{api}/v3/config")
-        if s == 200:
-            try:
-                count = len(json.loads(raw).get("items", []))
-            except json.JSONDecodeError:
-                count = 0
+        # Probe with HEAD; expect 405 Method Not Allowed if the endpoint exists
+        # (it only accepts POST), 401/403 if our key is wrong, etc.
+        try:
+            req = urllib.request.Request(
+                api, method="HEAD",
+                headers={"x-api-key": CONTROL_API_KEY},
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                checks.append({
+                    "name": f"Cloud admin API ({api})",
+                    "ok": True,
+                    "message": f"reachable (HTTP {r.status})",
+                })
+        except urllib.error.HTTPError as exc:
+            if exc.code == 405:
+                checks.append({
+                    "name": f"Cloud admin API ({api})",
+                    "ok": True,
+                    "message": "reachable (HTTP 405 — endpoint expects POST, which the Sync button does)",
+                })
+            elif exc.code in (401, 403):
+                checks.append({
+                    "name": f"Cloud admin API ({api})",
+                    "ok": False,
+                    "message": f"auth denied (HTTP {exc.code}). Check CONTROL_API_KEY value matches what the cloud expects.",
+                })
+            elif exc.code == 404:
+                checks.append({
+                    "name": f"Cloud admin API ({api})",
+                    "ok": False,
+                    "message": f"HTTP 404 — URL is wrong. Should be http://<cloud>/api/v1/admin/cloud-pull-cameras",
+                })
+            else:
+                try:
+                    body = exc.read().decode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    body = ""
+                checks.append({
+                    "name": f"Cloud admin API ({api})",
+                    "ok": False,
+                    "message": f"HTTP {exc.code}: {body[:160] or exc.reason}",
+                })
+        except (urllib.error.URLError, OSError) as exc:
             checks.append({
-                "name": f"Cloud mediamtx API ({api})",
-                "ok": True,
-                "message": f"reachable, {count} paths configured on cloud",
-            })
-        elif s in (401, 403):
-            checks.append({
-                "name": f"Cloud mediamtx API ({api})",
+                "name": f"Cloud admin API ({api})",
                 "ok": False,
-                "message": f"auth denied (HTTP {s}). Cloud's authInternalUsers must allow CGNAT (100.64.0.0/10) for action: api",
-            })
-        elif s == 0:
-            checks.append({
-                "name": f"Cloud mediamtx API ({api})",
-                "ok": False,
-                "message": f"cannot connect: {raw[:160]}. Try the cloud's tailnet IP instead of the name; check DNS in container",
-            })
-        else:
-            checks.append({
-                "name": f"Cloud mediamtx API ({api})",
-                "ok": False,
-                "message": f"HTTP {s}: {raw[:160]}",
+                "message": f"cannot connect: {exc}. If the host is a tailnet name, the installer-ui container's DNS may not resolve it; use the tailnet IP or fix Docker daemon DNS.",
             })
 
     health = cloud.get("healthUrl", "").strip()
@@ -1026,9 +1071,10 @@ def api_cloud_test():
 @app.post("/api/cloud-sync")
 @auth_required
 def api_cloud_sync():
-    """Manually push the current cameras config to the cloud mediamtx and
-    return a structured report. Same logic that runs on every save_config()."""
-    return jsonify(sync_cloud_mediamtx_paths(load_config()))
+    """Register this box's current camera list with the cloud's admin
+    endpoint. Cloud is master and generates mediamtx paths from the
+    registration. Same logic that runs on every save_config()."""
+    return jsonify(register_cameras_with_cloud(load_config()))
 
 
 @app.get("/api/cloud-config")
@@ -1237,8 +1283,8 @@ INDEX_HTML = """<!doctype html>
             <div class="full"><label>Cloud health URL (optional)</label>
               <input name="healthUrl" id="cloud-health" placeholder="https://cloud.example/api/edge-health">
             </div>
-            <div class="full"><label>Cloud mediamtx API URL (auto-syncs paths)</label>
-              <input name="mediamtxApiUrl" id="cloud-api" placeholder="http://merlin-cloud:9997">
+            <div class="full"><label>Cloud admin API URL (camera registration)</label>
+              <input name="adminApiUrl" id="cloud-admin-api" placeholder="http://merlin-cloud/api/v1/admin/cloud-pull-cameras">
             </div>
             <div class="full actions">
               <button type="submit">Save cloud</button>
@@ -1247,8 +1293,8 @@ INDEX_HTML = """<!doctype html>
             </div>
           </form>
           <div id="cloud-msg"></div>
-          <p class="small" style="margin-top:10px">Tailscale hostname tells the cloud where to pull from. Find it with <code class="mono">tailscale status --self</code> or in the Tailscale admin.</p>
-          <p class="small">Mediamtx API URL: when set, this box auto-pushes its <code>&lt;site&gt;-&lt;slug&gt;</code> paths to the cloud's mediamtx on every save. Cloud's mediamtx must allow API from tailnet (see docs). The <strong>Sync cloud now</strong> button re-runs the same push and reports exactly what happened.</p>
+          <p class="small" style="margin-top:10px">Tailscale hostname tells the cloud which box to pull from. Find it with <code class="mono">tailscale status --self --json | jq -r '.Self.DNSName'</code>.</p>
+          <p class="small">Cloud admin API URL: this box POSTs its camera list to the cloud's <code>/api/v1/admin/cloud-pull-cameras</code> on every save. The cloud is master — it generates mediamtx paths from the registration. Requires <code>CONTROL_API_KEY</code> in the box's <code>.env</code>. <strong>Sync cloud now</strong> re-posts immediately; <strong>Test cloud</strong> probes the URL + auth without changing state.</p>
         </div>
 
         <div class="card">
@@ -1410,7 +1456,7 @@ INDEX_HTML = """<!doctype html>
       setIfNotFocused('cloud-tailnet', cfg.config.cloud.tailnetHost || '');
       setIfNotFocused('cloud-playback', cfg.config.cloud.playbackHost || '');
       setIfNotFocused('cloud-health', cfg.config.cloud.healthUrl || '');
-      setIfNotFocused('cloud-api', cfg.config.cloud.mediamtxApiUrl || '');
+      setIfNotFocused('cloud-admin-api', cfg.config.cloud.adminApiUrl || '');
       setIfNotFocused('cloud-yaml', cfg.cloudPathsYaml || '');
 
       renderCameras(cfg.config.cameras, cfg.urls, statusByCam, recPerCam);
@@ -1450,14 +1496,13 @@ INDEX_HTML = """<!doctype html>
         }
         if (!r.ok) {
           const errs = (r.errors || []).join('; ');
-          showMsg('#cloud-msg', 'Cloud sync errors: ' + errs, true);
+          showMsg('#cloud-msg', 'Cloud registration failed: ' + errs, true);
           return;
         }
-        const parts = [];
-        if (r.added.length)   parts.push(r.added.length   + ' added (' + r.added.join(', ') + ')');
-        if (r.updated.length) parts.push(r.updated.length + ' updated');
-        if (r.deleted.length) parts.push(r.deleted.length + ' deleted (' + r.deleted.join(', ') + ')');
-        showMsg('#cloud-msg', 'Cloud sync OK · ' + (parts.join(', ') || 'no changes'));
+        const paths = (r.registered || []).join(', ');
+        const msg = 'Registered ' + r.cameraCount + ' cameras with cloud'
+                  + (paths ? ' · ' + paths : '');
+        showMsg('#cloud-msg', msg);
       } catch (err) { showMsg('#cloud-msg', err.message, true); }
     });
 
