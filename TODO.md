@@ -5,31 +5,24 @@ relevant section. Each item has rough effort and ownership noted.
 
 ---
 
-## Cloud-side blockers
+## Cloud-side items
 
-These are handled on `merlin-cloud`, not this box. The box is healthy without
-them, but auto-sync, DVR, and a few pieces of UX are degraded until the
-cloud team closes them.
+The architecture moved to "cloud is master" via the
+`/api/v1/admin/cloud-pull-cameras` admin endpoint
+([docs at merlin-map-video-clients-api.txt](merlin-map-video-clients-api.txt)).
+Several previously-listed cloud blockers are now obsolete (struck through).
 
-- [ ] **Reopen mediamtx API port `:9997` on the cloud.** From this box,
-      `nc -zv merlin-cloud 9997` returns "connection refused". The cloud's
-      compose probably regressed the public port mapping. Without this, the
-      box's `sync_cloud_mediamtx_paths()` can't auto-push path config when
-      cameras are added/edited/removed. Workaround: use the **Cloud-side
-      mediamtx config** card in the box UI to copy/paste YAML by hand. *Owner:
-      cloud team. Effort: 1 line in `cloud/compose.yaml` + restart.*
+- ~~Reopen mediamtx API port `:9997` on the cloud~~ — **no longer needed**.
+  Box no longer talks to cloud's mediamtx API directly; it POSTs camera
+  registration to the new admin endpoint on port 80 instead.
 
-- [ ] **Confirm cloud's `authInternalUsers` permits `100.64.0.0/10` for
-      `action: api`.** Required for the box to call the cloud's mediamtx
-      API once `:9997` is reopened. Was added once already; verify it didn't
-      regress. *Owner: cloud team. Effort: 5 lines.*
+- ~~`authInternalUsers` permitting `100.64.0.0/10` for `action: api`~~ —
+  no longer needed for the same reason.
 
-- [ ] **Reopen mediamtx playback port `:9996` on the cloud** (only if you
-      want it accessible directly; the agreed DVR plan goes browser → cloud
-      Caddy → **box's** `:9996`, so the cloud's own `:9996` is technically
-      not in the data path). Same `nc -zv merlin-cloud 9996` returns refused.
-      Drop this item if the architecture is now strictly "cloud Caddy proxies
-      to box's playback-shim". *Owner: cloud team. Effort: 1 line.*
+- ~~Reopen mediamtx playback port `:9996` on the cloud~~ — **moot for
+  DVR**. The agreed DVR plan goes browser → cloud Caddy → **box's** `:9996`
+  (the playback-shim), so the cloud's own `:9996` was never in the data
+  path.
 
 - [ ] **Configure Caddy `handle /dvr/*` block on the cloud** that
       reverse-proxies to `http://merlin-edge-videoclient:9996`. Box-side is
@@ -44,25 +37,16 @@ cloud team closes them.
 
 - [ ] **Tailscale ACL: confirm `merlin-cloud → merlin-edge-videoclient:9996`
       is permitted.** Same direction/host pattern as the existing `:8554`
-      rule. Box currently has an unrelated tailnet ACL warning that
-      `--ssh` was enabled but no ACL allows SSH; harmless for streaming.
-      *Owner: tailnet admin. Effort: 1 ACL line.*
+      rule. *Owner: tailnet admin. Effort: 1 ACL line.*
 
 - [ ] **Cloud agent: build `/api/edge-health` receiver.** Box already POSTs
-      every 60s (when `cloud.healthUrl` is reachable). Spec at
+      every 60s when `cloud.healthUrl` is set. Spec at
       [docs/cloud-health-api.md](docs/cloud-health-api.md). MVP: persist
       last-seen + per-camera state, alert on staleness. *Owner: cloud team.*
 
-- [ ] **Cloud agent: auto-generate cloud mediamtx paths from health POSTs.**
-      Replaces both the per-camera box-side push *and* the manual paste
-      step. Cloud receives box health → unions all reported boxes →
-      rewrites cloud mediamtx config. Eliminates highest-friction install
-      step. *Owner: cloud team. Effort: medium — half day.*
-
 - [ ] **Cloud-side gap.mp4 fix.** Cloud's HLS muxer references `gap.mp4`
       placeholders during source startup that 404 in the browser. Visible
-      to viewers as a brief glitch on cold-start. Newer mediamtx handles
-      this cleaner; could be an upgrade. *Owner: cloud team. Cosmetic.*
+      to viewers as a brief glitch on cold-start. *Owner: cloud team. Cosmetic.*
 
 ---
 
@@ -208,6 +192,11 @@ that look healthy but aren't producing frames.
 
 ## Done (chronological reverse)
 
+- ✅ Cloud registration via `/api/v1/admin/cloud-pull-cameras` admin endpoint
+  (cloud is master; replaces the deprecated direct-mediamtx-API push)
+- ✅ `CONTROL_API_KEY` env var plumbing through compose + .env
+- ✅ `cloud_paths_yaml()` and former `sync_cloud_mediamtx_paths()` now emit
+  `rtspTransport: tcp` so cloud puller doesn't try UDP first and get RTSP 400
 - ✅ Edit Camera modal `logLevel: null` validation bug fix
 - ✅ Playback shim: query-string auth → mediamtx Basic auth
 - ✅ mediamtx config: `playback: yes` + `merlinread` user
