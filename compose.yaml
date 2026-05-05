@@ -34,7 +34,7 @@ services:
       - installer-ui
     ports:
       - "8554:8554"           # RTSP — reachable by cloud over Tailscale
-      - "127.0.0.1:9997:9997" # API — local only
+      - "9997:9997"           # admin API — reachable by merlin-map over Tailscale (gate via tailnet ACL)
       - "127.0.0.1:9998:9998" # metrics — local only
       # mediamtx playback (9996) is intentionally NOT exposed.
       # The playback-shim service below sits in front of it on :9996.

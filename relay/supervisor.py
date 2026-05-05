@@ -84,6 +84,9 @@ def desired_cameras(cfg: dict) -> dict[str, dict]:
     for cam in cfg.get("cameras", []):
         if not cam.get("enabled", True):
             continue
+        if str(cam.get("sourceMode", "rtsp-push")).lower() == "hls-pull":
+            # mediamtx pulls the upstream itself; no relay ffmpeg needed.
+            continue
         slug = cam.get("slug")
         url = cam.get("sourceUrl")
         if not slug or not url:

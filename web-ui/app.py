@@ -194,6 +194,21 @@ def write_mediamtx_yml(cfg: dict) -> None:
         "    permissions:\n"
         "      - action: playback\n"
         "\n"
+        "  # Canonical merlin-video standard users (mediamtx-standard.md §2).\n"
+        "  # merlin-map server reaches both directly over Tailscale.\n"
+        "  - user: merlinmap\n"
+        "    pass: b2kWN3m94KGILWWLmdk+Y79j5UxNb+8r\n"
+        "    permissions:\n"
+        "      - action: api\n"
+        "\n"
+        "  - user: merlinplayback\n"
+        "    pass: GQDj6SKCK9sWqrNHLLOEuogZl2uPB7gv\n"
+        "    permissions:\n"
+        "      - action: read\n"
+        "        path: ''\n"
+        "      - action: playback\n"
+        "        path: ''\n"
+        "\n"
         "  # API / metrics / pprof: loopback + Docker bridge only.\n"
         "  - user: any\n"
         "    ips: [127.0.0.1, '::1', 172.16.0.0/12]\n"
@@ -218,7 +233,12 @@ def write_mediamtx_yml(cfg: dict) -> None:
             slug = cam["slug"]
             record = bool(cam.get("record", False))
             retain = int(cam.get("retainHours", 24) or 24)
+            source_mode = str(cam.get("sourceMode", "rtsp-push")).lower()
             lines.append(f"  {slug}:")
+            if source_mode == "hls-pull":
+                # mediamtx pulls the upstream m3u8 itself; no relay ffmpeg.
+                lines.append(f"    source: {cam.get('sourceUrl', '')}")
+                lines.append("    sourceOnDemand: no")
             lines.append(f"    record: {'yes' if record else 'no'}")
             if record:
                 lines.append(f"    recordDeleteAfter: {retain}h")
@@ -428,15 +448,25 @@ def validate_defaults(payload: dict) -> dict:
     }
 
 
+VALID_SOURCE_MODES = {"rtsp-push", "hls-pull"}
+
+
 def validate_camera(payload: dict, conflicting_slugs: set[str]) -> dict:
     slug = normalize_slug(payload.get("slug", ""))
     if not slug:
         raise ValueError("slug is required")
     if slug in conflicting_slugs:
         raise ValueError(f"camera slug '{slug}' already exists")
+    source_mode = str(payload.get("sourceMode", "rtsp-push")).lower()
+    if source_mode not in VALID_SOURCE_MODES:
+        raise ValueError(f"sourceMode must be one of: {', '.join(sorted(VALID_SOURCE_MODES))}")
     url = str(payload.get("sourceUrl", "")).strip()
-    if not (url.startswith("rtsp://") or url.startswith("rtsps://")):
-        raise ValueError("sourceUrl must start with rtsp:// or rtsps://")
+    if source_mode == "hls-pull":
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ValueError("hls-pull sourceUrl must start with http:// or https://")
+    else:
+        if not (url.startswith("rtsp://") or url.startswith("rtsps://")):
+            raise ValueError("sourceUrl must start with rtsp:// or rtsps://")
     transport = str(payload.get("rtspTransport", "tcp")).lower()
     if transport not in VALID_TRANSPORTS:
         raise ValueError("rtspTransport must be tcp or udp")
@@ -456,6 +486,7 @@ def validate_camera(payload: dict, conflicting_slugs: set[str]) -> dict:
     return {
         "slug": slug,
         "displayName": str(payload.get("displayName", "")),
+        "sourceMode": source_mode,
         "sourceUrl": url,
         "rtspTransport": transport,
         "tlsVerify": bool(payload.get("tlsVerify", False)),
