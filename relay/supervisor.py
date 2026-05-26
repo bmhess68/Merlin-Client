@@ -14,6 +14,8 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 CONFIG_PATH = Path("/data/config.json")
@@ -22,6 +24,8 @@ THUMBNAILS_ROOT = Path("/data/thumbnails")
 POLL_SECONDS = 2
 RESTART_BACKOFF_SECONDS = 3
 SNAPSHOT_EVERY_SECONDS = 60
+MEDIAMTX_API_URL = "http://mediamtx:9997/v3/paths/list"
+PATH_READY_GRACE_SECONDS = 30
 
 
 def load_config() -> dict:
@@ -155,6 +159,19 @@ def take_snapshot(slug: str) -> None:
             pass
 
 
+def load_mediamtx_ready_paths() -> dict[str, bool] | None:
+    try:
+        with urllib.request.urlopen(MEDIAMTX_API_URL, timeout=2) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return None
+    return {
+        item.get("name", ""): bool(item.get("ready"))
+        for item in payload.get("items", [])
+        if item.get("name")
+    }
+
+
 def write_status(procs: dict[str, dict], site_slug: str, now: float) -> None:
     cameras = []
     for slug, st in procs.items():
@@ -245,6 +262,27 @@ def main() -> None:
             if (now - last_snapshot.get(slug, 0)) >= SNAPSHOT_EVERY_SECONDS:
                 last_snapshot[slug] = now
                 take_snapshot(slug)
+
+        ready_paths = load_mediamtx_ready_paths()
+        if ready_paths is not None:
+            for slug, st in list(procs.items()):
+                proc = st["proc"]
+                if proc.poll() is not None:
+                    st.pop("not_ready_since", None)
+                    continue
+                if ready_paths.get(slug, False):
+                    st.pop("not_ready_since", None)
+                    continue
+                if (now - st["started"]) < PATH_READY_GRACE_SECONDS:
+                    continue
+                not_ready_since = st.setdefault("not_ready_since", now)
+                if (now - not_ready_since) >= PATH_READY_GRACE_SECONDS:
+                    print(
+                        f"[{slug}] mediamtx path not ready; restarting ffmpeg",
+                        flush=True,
+                    )
+                    st["last_failure_at"] = now
+                    stop(proc)
 
         write_status(procs, site.get("slug", ""), now)
         time.sleep(POLL_SECONDS)
