@@ -60,13 +60,17 @@ VALID_LOG_LEVELS = {
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip() or "admin"
 
-# Shared password for the cloud Caddy → mediamtx playback proxy.
-# When unset, a placeholder password is written so mediamtx still loads;
-# playback auth simply won't succeed until the env var is set.
-MERLINREAD_PASSWORD = os.environ.get(
-    "MERLINREAD_PASSWORD",
-    "unset-set-MERLINREAD_PASSWORD-in-env",
+# MediaMTX credentials used for cloud/API/playback access. The legacy
+# MERLINREAD_PASSWORD fallback keeps older .env files working.
+MEDIAMTX_API_USER = os.environ.get("MEDIAMTX_API_USER", "merlinmap").strip() or "merlinmap"
+MEDIAMTX_API_PASSWORD = os.environ.get("MEDIAMTX_API_PASSWORD", "").strip()
+MEDIAMTX_PLAYBACK_USER = os.environ.get("MEDIAMTX_PLAYBACK_USER", "merlinplayback").strip() or "merlinplayback"
+MEDIAMTX_PLAYBACK_PASSWORD = os.environ.get(
+    "MEDIAMTX_PLAYBACK_PASSWORD",
+    os.environ.get("MERLINREAD_PASSWORD", "unset-set-MEDIAMTX_PLAYBACK_PASSWORD-in-env"),
 ).strip()
+MEDIAMTX_PUBLISH_USER = os.environ.get("MEDIAMTX_PUBLISH_USER", "merlinpublish").strip() or "merlinpublish"
+MEDIAMTX_PUBLISH_PASSWORD = os.environ.get("MEDIAMTX_PUBLISH_PASSWORD", "").strip()
 
 # Control-plane API key for POSTing camera registrations to the cloud's
 # /api/v1/admin/cloud-pull-cameras endpoint. Cloud is master — it owns
@@ -169,38 +173,52 @@ def write_mediamtx_yml(cfg: dict) -> None:
         "\n"
         "playback: yes\n"
         "playbackAddress: :9996\n"
+        "playbackEncryption: no\n"
+        "playbackAllowOrigin: '*'\n"
+        "\n"
+        "hls: yes\n"
+        "hlsAddress: :8888\n"
+        "hlsAllowOrigin: '*'\n"
         "\n"
         "webrtc: no\n"
-        "hls: no\n"
+        "webrtcAddress: :8889\n"
         "rtmp: no\n"
         "srt: no\n"
         "\n"
         "authMethod: internal\n"
         "\n"
         "authInternalUsers:\n"
-        "  # Tailnet-internal: cloud's RTSP pull + edge supervisor publish.\n"
-        "  # 100.64.0.0/10 is the Tailscale CGNAT range — covers all tailnet IPs.\n"
+        "  # Tailnet/internal compatibility for the relay, local UI, and cloud pull.\n"
         "  - user: any\n"
         "    ips: [100.64.0.0/10, 172.16.0.0/12, 127.0.0.1, '::1']\n"
         "    permissions:\n"
         "      - action: publish\n"
         "      - action: read\n"
-        "\n"
-        "  # Public-facing playback: gated by the shared read credential\n"
-        "  # the Merlin web app passes via cloud Caddy for HLS / DVR.\n"
-        "  # Password from MERLINREAD_PASSWORD env var (set in .env).\n"
-        "  - user: merlinread\n"
-        f"    pass: {MERLINREAD_PASSWORD}\n"
-        "    permissions:\n"
-        "      - action: playback\n"
-        "\n"
-        "  # API / metrics / pprof: loopback + Docker bridge only.\n"
-        "  - user: any\n"
-        "    ips: [127.0.0.1, '::1', 172.16.0.0/12]\n"
-        "    permissions:\n"
         "      - action: api\n"
         "      - action: metrics\n"
         "      - action: pprof\n"
+        "\n"
+        f"  - user: {MEDIAMTX_API_USER}\n"
+        f"    pass: {MEDIAMTX_API_PASSWORD}\n"
+        "    ips: []\n"
+        "    permissions:\n"
+        "      - action: api\n"
+        "\n"
+        f"  - user: {MEDIAMTX_PLAYBACK_USER}\n"
+        f"    pass: {MEDIAMTX_PLAYBACK_PASSWORD}\n"
+        "    ips: []\n"
+        "    permissions:\n"
+        "      - action: read\n"
+        "        path: ''\n"
+        "      - action: playback\n"
+        "        path: ''\n"
+        "\n"
+        f"  - user: {MEDIAMTX_PUBLISH_USER}\n"
+        f"    pass: {MEDIAMTX_PUBLISH_PASSWORD}\n"
+        "    ips: []\n"
+        "    permissions:\n"
+        "      - action: publish\n"
+        "        path: ''\n"
         "\n"
         "pathDefaults:\n"
         "  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f\n"
