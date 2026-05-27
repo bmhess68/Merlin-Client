@@ -17,6 +17,12 @@ services:
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
       ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
       MERLINREAD_PASSWORD: "${MERLINREAD_PASSWORD:-}"
+      MEDIAMTX_API_USER: "${MEDIAMTX_API_USER:-merlinmap}"
+      MEDIAMTX_API_PASSWORD: "${MEDIAMTX_API_PASSWORD:-}"
+      MEDIAMTX_PLAYBACK_USER: "${MEDIAMTX_PLAYBACK_USER:-merlinplayback}"
+      MEDIAMTX_PLAYBACK_PASSWORD: "${MEDIAMTX_PLAYBACK_PASSWORD:-}"
+      MEDIAMTX_PUBLISH_USER: "${MEDIAMTX_PUBLISH_USER:-merlinpublish}"
+      MEDIAMTX_PUBLISH_PASSWORD: "${MEDIAMTX_PUBLISH_PASSWORD:-}"
       CONTROL_API_KEY: "${CONTROL_API_KEY:-}"
     volumes:
       - ./data:/data
@@ -34,6 +40,8 @@ services:
       - installer-ui
     ports:
       - "8554:8554"           # RTSP — reachable by cloud over Tailscale
+      - "8888:8888"           # HLS — reachable by cloud over Tailscale
+      - "8889:8889"           # WebRTC address reserved for remote playback clients
       - "127.0.0.1:9997:9997" # API — local only
       - "127.0.0.1:9998:9998" # metrics — local only
       # mediamtx playback (9996) is intentionally NOT exposed.
