@@ -62,6 +62,7 @@ ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip() or "admin"
 
 # MediaMTX credentials used for cloud/API/playback access. The legacy
 # MERLINREAD_PASSWORD fallback keeps older .env files working.
+MERLINREAD_PASSWORD = os.environ.get("MERLINREAD_PASSWORD", "").strip()
 MEDIAMTX_API_USER = os.environ.get("MEDIAMTX_API_USER", "merlinmap").strip() or "merlinmap"
 MEDIAMTX_API_PASSWORD = os.environ.get("MEDIAMTX_API_PASSWORD", "").strip()
 MEDIAMTX_PLAYBACK_USER = os.environ.get("MEDIAMTX_PLAYBACK_USER", "merlinplayback").strip() or "merlinplayback"
