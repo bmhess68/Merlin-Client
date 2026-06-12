@@ -2,6 +2,7 @@ FROM python:3.12-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl xz-utils ca-certificates \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # ffmpeg static build from BtbN (ffmpeg 8.x, supports -tls_verify as a global option).

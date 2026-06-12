@@ -10,6 +10,7 @@ services:
   installer-ui:
     build:
       context: ./web-ui
+      network: host
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -17,12 +18,26 @@ services:
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
       ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
       MERLINREAD_PASSWORD: "${MERLINREAD_PASSWORD:-}"
+      MEDIAMTX_API_USER: "${MEDIAMTX_API_USER:-merlinmap}"
+      MEDIAMTX_API_PASSWORD: "${MEDIAMTX_API_PASSWORD:-}"
+      MEDIAMTX_PLAYBACK_USER: "${MEDIAMTX_PLAYBACK_USER:-merlinplayback}"
+      MEDIAMTX_PLAYBACK_PASSWORD: "${MEDIAMTX_PLAYBACK_PASSWORD:-}"
+      MEDIAMTX_PUBLISH_USER: "${MEDIAMTX_PUBLISH_USER:-merlinpublish}"
+      MEDIAMTX_PUBLISH_PASSWORD: "${MEDIAMTX_PUBLISH_PASSWORD:-}"
       CONTROL_API_KEY: "${CONTROL_API_KEY:-}"
     volumes:
       - ./data:/data
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /var/run/docker.sock:/var/run/docker.sock
+    # Gate downstream services on mediamtx.yml existing as a real file so
+    # Docker can't auto-create it as a directory and break the bind mount.
+    healthcheck:
+      test: ["CMD", "test", "-f", "/data/mediamtx.yml"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
     networks:
       - edge
     logging: *default-logging
@@ -31,10 +46,13 @@ services:
     image: bluenviron/mediamtx:latest
     restart: unless-stopped
     depends_on:
-      - installer-ui
+      installer-ui:
+        condition: service_healthy
     ports:
       - "8554:8554"           # RTSP — reachable by cloud over Tailscale
-      - "9997:9997"           # admin API — reachable by merlin-map over Tailscale (gate via tailnet ACL)
+      - "8888:8888"           # HLS — reachable by cloud over Tailscale
+      - "8889:8889"           # WebRTC address reserved for remote playback clients
+      - "127.0.0.1:9997:9997" # API — local only
       - "127.0.0.1:9998:9998" # metrics — local only
       # mediamtx playback (9996) is intentionally NOT exposed.
       # The playback-shim service below sits in front of it on :9996.
@@ -48,6 +66,7 @@ services:
   relay:
     build:
       context: ./relay
+      network: host
     restart: unless-stopped
     depends_on:
       - mediamtx
@@ -60,6 +79,7 @@ services:
   playback-shim:
     build:
       context: ./playback-shim
+      network: host
     restart: unless-stopped
     depends_on:
       - mediamtx
