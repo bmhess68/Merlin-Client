@@ -33,14 +33,14 @@ TAILNET_IP_FILE = DATA_DIR / "tailnet-ip.txt"
 HOST_PROC = Path("/host/proc")
 
 DEFAULT_CONFIG = {
-    "version": 3,
+    "version": 4,
     "site": {"slug": "site1", "displayName": ""},
     "cloud": {
-        "tailnetHost": "",
-        "playbackHost": "",
-        "healthUrl": "",
-        "adminApiUrl": "",      # http://<cloud>/api/v1/admin/cloud-pull-cameras
-        "mediamtxApiUrl": "",   # legacy; unused by the new admin-API flow
+        # The box pulls these from the operator; every cloud-facing URL is
+        # derived from them (see cloud_admin_url / cloud_health_url / map_geo_url).
+        "tailnetHost": "",   # the box's OWN tailnet IP — the cloud pulls RTSP from here
+        "cloudHost": "",     # merlin-cloud IP/host — admin API, health, playback derive from this
+        "mapHost": "",       # merlin-map IP/host — camera-geo API derives from this
     },
     "defaults": {
         "rtspTransport": "tcp",
@@ -123,6 +123,25 @@ def upgrade_to_v3(cfg: dict) -> dict:
     defaults = cfg.setdefault("defaults", {})
     defaults.setdefault("record", True)
     defaults.setdefault("retainHours", 168)
+    return cfg
+
+
+def upgrade_to_v4(cfg: dict) -> dict:
+    """v3 (explicit cloud URLs) → v4 (two host fields; URLs derived). Recovers
+    cloudHost from any v3 cloud URL, mapHost from the v3 map URL."""
+    cloud = cfg.get("cloud", {}) or {}
+    cloud_host = (
+        _host_from_url(cloud.get("adminApiUrl", ""))
+        or _host_from_url(cloud.get("healthUrl", ""))
+        or _strip_scheme(str(cloud.get("playbackHost", "")))
+    )
+    map_host = _host_from_url(cloud.get("mapApiUrl", ""))
+    cfg["cloud"] = {
+        "tailnetHost": _strip_scheme(str(cloud.get("tailnetHost", ""))),
+        "cloudHost": cloud_host,
+        "mapHost": map_host,
+    }
+    cfg["version"] = 4
     for cam in cfg.setdefault("cameras", []):
         cam.setdefault("record", True)
         cam.setdefault("retainHours", 168)
@@ -135,14 +154,18 @@ def load_config() -> dict:
         save_config(cfg, write_mediamtx=True)
         return cfg
     raw = json.loads(CONFIG_PATH.read_text())
+    dirty = False
     if "version" not in raw:
-        cfg = migrate_legacy(raw)
-        save_config(cfg, write_mediamtx=True)
-        return cfg
+        raw = migrate_legacy(raw)  # produces a current-version config
+        dirty = True
     if raw.get("version", 0) < 3:
-        cfg = upgrade_to_v3(raw)
-        save_config(cfg, write_mediamtx=True)
-        return cfg
+        raw = upgrade_to_v3(raw)
+        dirty = True
+    if raw.get("version", 0) < 4:
+        raw = upgrade_to_v4(raw)
+        dirty = True
+    if dirty:
+        save_config(raw, write_mediamtx=True)
     return raw
 
 
@@ -154,7 +177,10 @@ def save_config(cfg: dict, *, write_mediamtx: bool = True) -> None:
     if write_mediamtx:
         write_mediamtx_yml(cfg)
         sync_mediamtx_paths(cfg)
-        register_cameras_with_cloud(cfg)
+        # NOTE: cloud registration is intentionally NOT called here. It used to
+        # run on every save, which re-posted to the cloud admin endpoint
+        # constantly and reverted the cloud mediamtx YAML. Cloud + map sync is
+        # now a deliberate, operator-triggered action — see /api/cloud-sync.
 
 
 def write_mediamtx_yml(cfg: dict) -> None:
@@ -307,9 +333,9 @@ def register_cameras_with_cloud(cfg: dict) -> dict:
         "registered": [], "cameraCount": 0, "errors": [],
     }
     cloud = cfg.get("cloud", {}) or {}
-    api = cloud.get("adminApiUrl", "").strip().rstrip("/")
+    api = cloud_admin_url(cfg)
     if not api:
-        result["skipped"] = "Cloud admin API URL is not set in Site & Cloud."
+        result["skipped"] = "Merlin-cloud address is not set in Site & Cloud."
         return result
     if not CONTROL_API_KEY:
         result["skipped"] = (
@@ -323,17 +349,20 @@ def register_cameras_with_cloud(cfg: dict) -> dict:
         result["skipped"] = "Box's Tailscale hostname is not set in Site & Cloud."
         return result
 
-    cameras = []
+    # Keyed by slug so a hand-edited config.json with a duplicate slug can't
+    # emit two entries — the receiver upserts on (site, slug), last one wins.
+    by_slug: dict[str, dict] = {}
     for cam in cfg.get("cameras", []):
         if not cam.get("enabled", True):
             continue
         slug = cam.get("slug")
         if not slug:
             continue
-        cameras.append({
+        by_slug[slug] = {
             "slug": slug,
             "label": cam.get("displayName") or slug,
-        })
+        }
+    cameras = list(by_slug.values())
 
     body = {
         "site": site_slug,
@@ -366,6 +395,87 @@ def register_cameras_with_cloud(cfg: dict) -> dict:
                 if 200 <= r.status < 300:
                     result["ok"] = True
                     result["cameraCount"] = len(cameras)
+    except urllib.error.HTTPError as exc:
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            err_body = ""
+        result["errors"].append(f"HTTP {exc.code}: {err_body[:200] or exc.reason}")
+    except (urllib.error.URLError, OSError) as exc:
+        result["errors"].append(f"cannot connect: {exc}")
+
+    return result
+
+
+def push_geo_to_map(cfg: dict) -> dict:
+    """POST per-camera geo (lat/lon/bearing) straight to merlin-map's API.
+    This is map metadata, deliberately kept out of the cloud mediamtx admin
+    flow. Body shape:
+
+        { "site": "<slug>",
+          "cameras": [{"slug": "...", "label": "...",
+                       "lat": 42.65, "lon": -73.75, "bearing": 270}, ...] }
+
+    Authenticated with `x-api-key: <CONTROL_API_KEY>`. Only cameras that have
+    at least one geo field set are included; cameras with no geo are skipped.
+    """
+    result: dict = {
+        "ok": False, "skipped": None,
+        "cameraCount": 0, "errors": [],
+    }
+    cloud = cfg.get("cloud", {}) or {}
+    api = map_geo_url(cfg)
+    if not api:
+        result["skipped"] = "Merlin-map address is not set in Site & Cloud."
+        return result
+    if not CONTROL_API_KEY:
+        result["skipped"] = (
+            "CONTROL_API_KEY env var is not set on the box. "
+            "Add to .env and restart the installer-ui container."
+        )
+        return result
+    site_slug = cfg["site"]["slug"]
+
+    # Keyed by slug so a duplicate slug can't produce two map rows — merlin-map
+    # upserts on (site, slug), last one wins.
+    by_slug: dict[str, dict] = {}
+    for cam in cfg.get("cameras", []):
+        if not cam.get("enabled", True):
+            continue
+        slug = cam.get("slug")
+        if not slug:
+            continue
+        lat, lon, bearing = cam.get("lat"), cam.get("lon"), cam.get("bearing")
+        if lat is None and lon is None and bearing is None:
+            continue  # nothing to map for this camera
+        by_slug[slug] = {
+            "slug": slug,
+            "label": cam.get("displayName") or slug,
+            "lat": lat,
+            "lon": lon,
+            "bearing": bearing,
+        }
+    cameras = list(by_slug.values())
+
+    result["cameraCount"] = len(cameras)
+    body = {"site": site_slug, "cameras": cameras}
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        api,
+        data=data,
+        headers={
+            "content-type": "application/json",
+            "x-api-key": CONTROL_API_KEY,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            if 200 <= r.status < 300:
+                result["ok"] = True
+            else:
+                result["errors"].append(f"HTTP {r.status}: {raw[:200]}")
     except urllib.error.HTTPError as exc:
         try:
             err_body = exc.read().decode("utf-8", errors="replace")
@@ -446,13 +556,46 @@ def _ensure_url(value: str) -> str:
     return v
 
 
+def _host_base(host: str) -> str:
+    """A bare host/IP (optionally with :port) → `http://<host>` base, or '' if
+    empty. Tolerates a pasted scheme or trailing slash."""
+    h = _strip_scheme(str(host or "")).strip().strip("/")
+    return f"http://{h}" if h else ""
+
+
+def _host_from_url(url: str) -> str:
+    """Extract host[:port] from a full URL (used by the v3→v4 migration)."""
+    s = _strip_scheme(str(url or "")).strip()
+    return s.split("/", 1)[0] if s else ""
+
+
+# Fixed API paths — these match docs/API.md, the contract handed to the
+# merlin-cloud and merlin-map teams. Hosts come from config; paths are constant.
+ADMIN_API_PATH = "/api/v1/admin/cloud-pull-cameras"
+HEALTH_API_PATH = "/edge-health"
+MAP_GEO_API_PATH = "/api/v1/cameras/geo"
+
+
+def cloud_admin_url(cfg: dict) -> str:
+    base = _host_base(cfg.get("cloud", {}).get("cloudHost", ""))
+    return f"{base}{ADMIN_API_PATH}" if base else ""
+
+
+def cloud_health_url(cfg: dict) -> str:
+    base = _host_base(cfg.get("cloud", {}).get("cloudHost", ""))
+    return f"{base}{HEALTH_API_PATH}" if base else ""
+
+
+def map_geo_url(cfg: dict) -> str:
+    base = _host_base(cfg.get("cloud", {}).get("mapHost", ""))
+    return f"{base}{MAP_GEO_API_PATH}" if base else ""
+
+
 def validate_cloud(payload: dict) -> dict:
     return {
         "tailnetHost": _strip_scheme(str(payload.get("tailnetHost", ""))),
-        "playbackHost": _strip_scheme(str(payload.get("playbackHost", ""))),
-        "healthUrl": _ensure_url(str(payload.get("healthUrl", ""))),
-        "adminApiUrl": _ensure_url(str(payload.get("adminApiUrl", ""))),
-        "mediamtxApiUrl": _ensure_url(str(payload.get("mediamtxApiUrl", ""))),
+        "cloudHost": _strip_scheme(str(payload.get("cloudHost", ""))),
+        "mapHost": _strip_scheme(str(payload.get("mapHost", ""))),
     }
 
 
@@ -480,6 +623,22 @@ def validate_defaults(payload: dict) -> dict:
 
 
 VALID_SOURCE_MODES = {"rtsp-push", "hls-pull"}
+
+
+def _validate_geo_num(value, name: str, lo: float, hi: float):
+    """Parse an optional geo field. Empty/None → None (cleared). Otherwise must
+    be a number within [lo, hi]. Raises ValueError on a bad value."""
+    if value in (None, ""):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if num != num:  # NaN
+        raise ValueError(f"{name} must be a number")
+    if not (lo <= num <= hi):
+        raise ValueError(f"{name} must be between {lo} and {hi}")
+    return num
 
 
 def validate_camera(payload: dict, conflicting_slugs: set[str]) -> dict:
@@ -514,6 +673,11 @@ def validate_camera(payload: dict, conflicting_slugs: set[str]) -> dict:
         raise ValueError("retainHours must be a number") from exc
     if retain_hours < 1:
         raise ValueError("retainHours must be >= 1")
+    lat = _validate_geo_num(payload.get("lat"), "lat", -90.0, 90.0)
+    lon = _validate_geo_num(payload.get("lon"), "lon", -180.0, 180.0)
+    bearing = _validate_geo_num(payload.get("bearing"), "bearing", 0.0, 360.0)
+    if bearing == 360.0:
+        bearing = 0.0  # 360° and 0° are the same heading; normalize
     return {
         "slug": slug,
         "displayName": str(payload.get("displayName", "")),
@@ -524,6 +688,9 @@ def validate_camera(payload: dict, conflicting_slugs: set[str]) -> dict:
         "logLevel": log_level or None,
         "record": bool(payload.get("record", True)),
         "retainHours": retain_hours,
+        "lat": lat,
+        "lon": lon,
+        "bearing": bearing,
         "enabled": bool(payload.get("enabled", True)),
     }
 
@@ -537,7 +704,7 @@ def stream_urls(cfg: dict) -> dict:
     site_slug = cfg["site"]["slug"]
     cloud = cfg.get("cloud", {})
     tailnet_host = cloud.get("tailnetHost", "").strip() or f"<{site_slug}-tailnet-host>"
-    playback_host = cloud.get("playbackHost", "").strip()
+    playback_host = cloud.get("cloudHost", "").strip()
     out = {}
     for cam in cfg.get("cameras", []):
         slug = cam["slug"]
@@ -808,12 +975,12 @@ def cloud_test(cfg: dict) -> dict:
     cloud = cfg.get("cloud", {}) or {}
     checks = []
 
-    api = cloud.get("adminApiUrl", "").strip()
+    api = cloud_admin_url(cfg)
     if not api:
         checks.append({
-            "name": "Cloud admin API URL",
+            "name": "Merlin-cloud address",
             "ok": False,
-            "message": "Not set. Add it in Site & Cloud and Save (e.g. http://merlin-cloud/api/v1/admin/cloud-pull-cameras).",
+            "message": "Not set. Enter the merlin-cloud IP in Site & Cloud and Save.",
         })
     elif not CONTROL_API_KEY:
         checks.append({
@@ -871,12 +1038,69 @@ def cloud_test(cfg: dict) -> dict:
                 "message": f"cannot connect: {exc}. If the host is a tailnet name, the installer-ui container's DNS may not resolve it; use the tailnet IP or fix Docker daemon DNS.",
             })
 
-    health = cloud.get("healthUrl", "").strip()
+    map_api = map_geo_url(cfg)
+    if not map_api:
+        checks.append({
+            "name": "Merlin-map address",
+            "ok": True,
+            "message": "not configured (optional — leave empty until merlin-map exposes its geo endpoint).",
+        })
+    elif not CONTROL_API_KEY:
+        checks.append({
+            "name": "CONTROL_API_KEY env var (for merlin-map)",
+            "ok": False,
+            "message": "Not set. Add CONTROL_API_KEY=... to .env and `docker compose up -d --build installer-ui`.",
+        })
+    else:
+        try:
+            req = urllib.request.Request(
+                map_api, method="HEAD",
+                headers={"x-api-key": CONTROL_API_KEY},
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                checks.append({
+                    "name": f"Merlin-map API ({map_api})",
+                    "ok": True,
+                    "message": f"reachable (HTTP {r.status})",
+                })
+        except urllib.error.HTTPError as exc:
+            if exc.code == 405:
+                checks.append({
+                    "name": f"Merlin-map API ({map_api})",
+                    "ok": True,
+                    "message": "reachable (HTTP 405 — endpoint expects POST, which the Sync button does)",
+                })
+            elif exc.code in (401, 403):
+                checks.append({
+                    "name": f"Merlin-map API ({map_api})",
+                    "ok": False,
+                    "message": f"auth denied (HTTP {exc.code}). Check CONTROL_API_KEY matches what merlin-map expects.",
+                })
+            else:
+                try:
+                    body = exc.read().decode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    body = ""
+                checks.append({
+                    "name": f"Merlin-map API ({map_api})",
+                    "ok": exc.code == 404,
+                    "message": (f"HTTP 404 — URL path may be wrong, but the host responded"
+                                if exc.code == 404 else
+                                f"HTTP {exc.code}: {body[:160] or exc.reason}"),
+                })
+        except (urllib.error.URLError, OSError) as exc:
+            checks.append({
+                "name": f"Merlin-map API ({map_api})",
+                "ok": False,
+                "message": f"cannot connect: {exc}. If the host is a tailnet name, use the tailnet IP instead.",
+            })
+
+    health = cloud_health_url(cfg)
     if not health:
         checks.append({
             "name": "Cloud health URL",
             "ok": True,
-            "message": "not configured (optional — leave empty if you don't have a receiver yet)",
+            "message": "not configured (derives from merlin-cloud address; set it to enable health POSTs)",
         })
     else:
         try:
@@ -925,7 +1149,7 @@ def _cloud_health_loop() -> None:
     while True:
         try:
             cfg = load_config()
-            url = cfg.get("cloud", {}).get("healthUrl", "").strip()
+            url = cloud_health_url(cfg)
             if url:
                 payload = build_health(cfg)
                 data = json.dumps(payload).encode()
@@ -947,7 +1171,7 @@ def build_health(cfg: dict) -> dict:
     return {
         "site": cfg["site"]["slug"],
         "tailnetHost": cfg["cloud"].get("tailnetHost", ""),
-        "playbackHost": cfg["cloud"].get("playbackHost", ""),
+        "cloudHost": cfg["cloud"].get("cloudHost", ""),
         "cameraCount": len(cfg.get("cameras", [])),
         "supervisor": supervisor_status(),
         "host": {
@@ -1019,7 +1243,7 @@ def api_put_site():
 def api_put_cloud():
     cfg = load_config()
     cfg["cloud"] = validate_cloud(request.get_json(force=True))
-    save_config(cfg, write_mediamtx=True)  # triggers cloud sync if mediamtxApiUrl/tailnetHost changed
+    save_config(cfg, write_mediamtx=True)  # local only; cloud/map push is the manual Sync action
     return jsonify({"saved": True, "config": cfg, "urls": stream_urls(cfg)})
 
 
@@ -1146,13 +1370,43 @@ def api_cloud_test():
     return jsonify(cloud_test(load_config()))
 
 
+SYNC_CONFIRM_TOKEN = "SYNC"
+
+
 @app.post("/api/cloud-sync")
 @auth_required
 def api_cloud_sync():
-    """Register this box's current camera list with the cloud's admin
-    endpoint. Cloud is master and generates mediamtx paths from the
-    registration. Same logic that runs on every save_config()."""
-    return jsonify(register_cameras_with_cloud(load_config()))
+    """Operator-triggered sync. Saving cameras no longer contacts the cloud
+    automatically (that caused rogue YAML reverts); this is the only path that
+    does. Requires an explicit typed confirmation in the body so a human has to
+    deliberately trigger it. Fans out to two independent endpoints and reports
+    each separately:
+
+      - cloudPaths: registers stream paths with the cloud mediamtx admin API
+      - map:        pushes camera geo (lat/lon/bearing) straight to merlin-map
+
+    Returns {ok, confirmed, cloudPaths: {...}, map: {...}} where ok is true only
+    if neither endpoint reported an error (an endpoint that is unconfigured /
+    skipped does not count as a failure)."""
+    payload = request.get_json(silent=True) or {}
+    confirm = str(payload.get("confirm", "")).strip().upper()
+    if confirm != SYNC_CONFIRM_TOKEN:
+        return jsonify({
+            "ok": False,
+            "confirmed": False,
+            "error": f"Confirmation required: type {SYNC_CONFIRM_TOKEN} to sync.",
+        }), 400
+
+    cfg = load_config()
+    cloud_paths = register_cameras_with_cloud(cfg)
+    geo = push_geo_to_map(cfg)
+    ok = not cloud_paths.get("errors") and not geo.get("errors")
+    return jsonify({
+        "ok": ok,
+        "confirmed": True,
+        "cloudPaths": cloud_paths,
+        "map": geo,
+    })
 
 
 @app.get("/api/cloud-config")
@@ -1214,6 +1468,7 @@ INDEX_HTML = """<!doctype html>
     .pill.off { background: #e7ecea; color: var(--muted); }
     .toast { padding: 10px 14px; border-radius: 12px; background: var(--accent-2); margin-top: 10px; }
     .toast.err { background: #f7d8c8; color: var(--warn); }
+    .toast.warn { background: #fbe8c8; color: #8a5a16; }
     .grid2 { display: grid; grid-template-columns: 2fr 1fr; gap: 18px; }
     @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
     details { margin-top: 8px; }
@@ -1277,6 +1532,16 @@ INDEX_HTML = """<!doctype html>
           <div><label>Retain hours</label>
             <input id="edit-retainHours" type="number" name="retainHours" min="1">
           </div>
+          <div><label>Latitude</label>
+            <input id="edit-lat" type="number" name="lat" step="any" min="-90" max="90" placeholder="42.6526">
+          </div>
+          <div><label>Longitude</label>
+            <input id="edit-lon" type="number" name="lon" step="any" min="-180" max="180" placeholder="-73.7562">
+          </div>
+          <div><label>Heading °</label>
+            <input id="edit-bearing" type="number" name="bearing" step="any" min="0" max="360" placeholder="0">
+            <span class="small" style="opacity:.7">0 = directly up (north); 90 = right, 180 = down, 270 = left</span>
+          </div>
           <div><label>Enabled</label>
             <select id="edit-enabled" name="enabled">
               <option value="true">yes</option><option value="false">no</option>
@@ -1288,6 +1553,23 @@ INDEX_HTML = """<!doctype html>
           </div>
         </form>
         <div id="edit-msg"></div>
+      </div>
+    </div>
+
+    <div id="sync-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Sync to cloud &amp; map</h2>
+        <p class="small">This pushes to the cloud now. It will (1) register stream paths with the cloud mediamtx admin API — the cloud regenerates its mediamtx paths from this — and (2) send camera geo (lat/long/heading) to merlin-map. Type <strong>SYNC</strong> to confirm.</p>
+        <form id="sync-form" class="row">
+          <div class="full"><label>Type SYNC to confirm</label>
+            <input id="sync-confirm" autocomplete="off" placeholder="SYNC">
+          </div>
+          <div class="full actions">
+            <button type="submit" id="sync-go">Sync now</button>
+            <button type="button" class="ghost" id="sync-cancel">Cancel</button>
+          </div>
+        </form>
+        <div id="sync-result"></div>
       </div>
     </div>
 
@@ -1319,6 +1601,11 @@ INDEX_HTML = """<!doctype html>
                 <select name="record"><option value="true">yes</option><option value="false">no</option></select>
               </div>
               <div><label>Retain hours</label><input type="number" name="retainHours" value="168" min="1"></div>
+              <div><label>Latitude</label><input type="number" name="lat" step="any" min="-90" max="90" placeholder="42.6526"></div>
+              <div><label>Longitude</label><input type="number" name="lon" step="any" min="-180" max="180" placeholder="-73.7562"></div>
+              <div><label>Heading °</label><input type="number" name="bearing" step="any" min="0" max="360" placeholder="0">
+                <span class="small" style="opacity:.7">0 = directly up (north); 90 = right (east), 180 = down, 270 = left</span>
+              </div>
               <div><label>Enabled</label>
                 <select name="enabled"><option value="true">yes</option><option value="false">no</option></select>
               </div>
@@ -1356,24 +1643,22 @@ INDEX_HTML = """<!doctype html>
               <input name="tailnetHost" id="cloud-tailnet" placeholder="100.86.38.62">
               <button type="button" class="ghost" id="use-box-ip" hidden style="margin-top:6px;font-size:12px;padding:4px 10px">Use this box's tailnet IP</button>
             </div>
-            <div class="full"><label>Cloud playback hostname (informational)</label>
-              <input name="playbackHost" id="cloud-playback" placeholder="147.182.179.39 or merlin-cloud">
+            <div class="full"><label>Merlin-cloud address (IP) — stream paths, health &amp; playback</label>
+              <input name="cloudHost" id="cloud-host" placeholder="100.112.231.52">
             </div>
-            <div class="full"><label>Cloud health URL (optional)</label>
-              <input name="healthUrl" id="cloud-health" placeholder="https://cloud.example/api/edge-health">
-            </div>
-            <div class="full"><label>Cloud admin API URL (camera registration)</label>
-              <input name="adminApiUrl" id="cloud-admin-api" placeholder="http://merlin-cloud/api/v1/admin/cloud-pull-cameras">
+            <div class="full"><label>Merlin-map address (IP) — camera geo (lat/long/heading)</label>
+              <input name="mapHost" id="cloud-map-host" placeholder="100.112.231.52">
             </div>
             <div class="full actions">
               <button type="submit">Save cloud</button>
-              <button type="button" class="ghost" id="cloud-sync-btn">Sync cloud now</button>
+              <button type="button" id="cloud-sync-btn">Sync now…</button>
               <button type="button" class="ghost" id="cloud-test-btn">Test cloud</button>
             </div>
           </form>
           <div id="cloud-msg"></div>
           <p class="small" style="margin-top:10px"><strong>Use the box's tailnet IP address</strong> — find it with <code class="mono">tailscale ip -4</code> on the box (e.g. <code class="mono">100.86.38.62</code>). Avoid the MagicDNS name (<code class="mono">*.tail*.ts.net</code>): the cloud's mediamtx runs in a Docker container whose embedded resolver doesn't always reach Tailscale's DNS, and the resulting "name does not resolve" failures are silent until a viewer can't load a camera.</p>
-          <p class="small">Cloud admin API URL: this box POSTs its camera list to the cloud's <code>/api/v1/admin/cloud-pull-cameras</code> on every save. The cloud is master — it generates mediamtx paths from the registration. Requires <code>CONTROL_API_KEY</code> in the box's <code>.env</code>. <strong>Sync cloud now</strong> re-posts immediately; <strong>Test cloud</strong> probes the URL + auth without changing state.</p>
+          <p class="small">Enter just the two IPs — the box builds the full endpoints from them: merlin-cloud → <code>http://&lt;cloud&gt;/api/v1/admin/cloud-pull-cameras</code> (stream paths), <code>http://&lt;cloud&gt;/edge-health</code> (health POSTs), and the playback host; merlin-map → <code>http://&lt;map&gt;/api/v1/cameras/geo</code> (camera geo). They can be the same IP if cloud and map share a host.</p>
+          <p class="small">Saving cameras stays <strong>local only</strong> — it no longer contacts the cloud, so it can't revert the cloud mediamtx YAML. Pushing to the cloud is now a deliberate action: <strong>Sync now…</strong> asks you to confirm, then does two independent pushes — (1) stream-path registration to merlin-cloud (cloud is master and regenerates its mediamtx paths) and (2) camera geo (lat/long/heading) straight to merlin-map. Both require <code>CONTROL_API_KEY</code> in the box's <code>.env</code>. <strong>Test cloud</strong> probes the endpoints + auth without changing state.</p>
         </div>
 
         <div class="card">
@@ -1469,11 +1754,12 @@ INDEX_HTML = """<!doctype html>
             <div class="small mono" style="margin-top:6px">${c.sourceUrl}</div>
             <div class="small mono">box → cloud: ${u.boxLocalUrl||'-'}</div>
             <div class="small mono">cloud path: ${u.cloudPath||'-'}</div>
-            <div class="small mono">playback: ${u.playbackUrl||'(set playbackHost)'}</div>
+            <div class="small mono">playback: ${u.playbackUrl||'(set merlin-cloud address)'}</div>
           </td>
           <td>
             <div class="small">${c.rtspTransport}${c.tlsVerify?'':' / no-verify'}</div>
             <div class="small">record: ${c.record?'yes ('+c.retainHours+'h)':'no'}</div>
+            ${geoLine(c)}
             ${recInfo}
           </td>
           <td>${pill(state)}</td>
@@ -1559,9 +1845,8 @@ INDEX_HTML = """<!doctype html>
       } else {
         setIfNotFocused('cloud-tailnet', stored);
       }
-      setIfNotFocused('cloud-playback', cfg.config.cloud.playbackHost || '');
-      setIfNotFocused('cloud-health', cfg.config.cloud.healthUrl || '');
-      setIfNotFocused('cloud-admin-api', cfg.config.cloud.adminApiUrl || '');
+      setIfNotFocused('cloud-host', cfg.config.cloud.cloudHost || '');
+      setIfNotFocused('cloud-map-host', cfg.config.cloud.mapHost || '');
       setIfNotFocused('cloud-yaml', cfg.cloudPathsYaml || '');
 
       renderCameras(cfg.config.cameras, cfg.urls, statusByCam, recPerCam);
@@ -1592,24 +1877,80 @@ INDEX_HTML = """<!doctype html>
       } catch (err) { showMsg('#cloud-msg', err.message, true); }
     });
 
-    $('#cloud-sync-btn').addEventListener('click', async () => {
+    // Build one confirmation box per endpoint from its result object.
+    function endpointBox(title, r) {
+      let cls, head, detail;
+      if (r.skipped) {
+        cls = 'warn'; head = '— ' + title + ': skipped';
+        detail = r.skipped;
+      } else if (r.errors && r.errors.length) {
+        cls = 'err'; head = '✗ ' + title + ': failed';
+        detail = r.errors.join('; ');
+      } else {
+        cls = ''; head = '✓ ' + title + ': ok';
+        const extra = (r.registered && r.registered.length)
+          ? ' · ' + r.registered.join(', ') : '';
+        detail = (r.cameraCount || 0) + ' camera(s)' + extra;
+      }
+      return '<div class="toast ' + cls + '" style="margin-top:8px">'
+           + '<strong>' + head + '</strong>'
+           + '<div class="small mono" style="margin-top:4px">' + detail + '</div></div>';
+    }
+
+    function openSync() {
+      $('#sync-confirm').value = '';
+      $('#sync-result').innerHTML = '';
+      $('#sync-overlay').hidden = false;
+      $('#sync-confirm').focus();
+    }
+    function closeSync() { $('#sync-overlay').hidden = true; }
+
+    $('#cloud-sync-btn').addEventListener('click', openSync);
+    $('#sync-cancel').addEventListener('click', closeSync);
+
+    $('#sync-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const confirm = $('#sync-confirm').value.trim();
+      const btn = $('#sync-go');
+      btn.disabled = true;
       try {
-        const r = await api('POST', '/api/cloud-sync');
-        if (r.skipped) {
-          showMsg('#cloud-msg', 'Skipped: ' + r.skipped, true);
+        const r = await api('POST', '/api/cloud-sync', { confirm });
+        if (r.confirmed === false) {
+          $('#sync-result').innerHTML =
+            '<div class="toast err" style="margin-top:8px">' + (r.error || 'Confirmation failed') + '</div>';
           return;
         }
-        if (!r.ok) {
-          const errs = (r.errors || []).join('; ');
-          showMsg('#cloud-msg', 'Cloud registration failed: ' + errs, true);
-          return;
-        }
-        const paths = (r.registered || []).join(', ');
-        const msg = 'Registered ' + r.cameraCount + ' cameras with cloud'
-                  + (paths ? ' · ' + paths : '');
-        showMsg('#cloud-msg', msg);
-      } catch (err) { showMsg('#cloud-msg', err.message, true); }
+        const banner = '<div class="toast ' + (r.ok ? '' : 'err') + '">'
+          + (r.ok ? 'Sync complete' : 'Sync finished with problems') + '</div>';
+        $('#sync-result').innerHTML = banner
+          + endpointBox('Cloud mediamtx (stream paths)', r.cloudPaths || {})
+          + endpointBox('Merlin-map (camera geo)', r.map || {});
+        showMsg('#cloud-msg', r.ok ? 'Synced to cloud + map.' : 'Sync finished with problems — see dialog.', !r.ok);
+        refresh();
+      } catch (err) {
+        $('#sync-result').innerHTML =
+          '<div class="toast err" style="margin-top:8px">' + err.message + '</div>';
+      } finally {
+        btn.disabled = false;
+      }
     });
+
+    // Camera table line summarizing geo, only when something is set.
+    function geoLine(c) {
+      const hasGeo = c.lat != null || c.lon != null || c.bearing != null;
+      if (!hasGeo) return '<div class="small" style="opacity:.6">geo: not set</div>';
+      const ll = (c.lat != null && c.lon != null) ? c.lat + ', ' + c.lon : '(lat/long incomplete)';
+      const br = c.bearing != null ? ' · hdg ' + c.bearing + '°' : '';
+      return '<div class="small mono">geo: ' + ll + br + '</div>';
+    }
+    // Optional geo field: '' → null (cleared), otherwise a Number.
+    function geoVal(v) {
+      if (v === '' || v === null || v === undefined) return null;
+      const n = Number(v);
+      return Number.isNaN(n) ? null : n;
+    }
+    // Display a stored geo value in an input (null/undefined → blank).
+    function geoStr(v) { return (v === null || v === undefined) ? '' : v; }
 
     $('#add-form').addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -1618,6 +1959,9 @@ INDEX_HTML = """<!doctype html>
       data.enabled = data.enabled === 'true';
       data.record = data.record === 'true';
       data.retainHours = Number(data.retainHours);
+      data.lat = geoVal(data.lat);
+      data.lon = geoVal(data.lon);
+      data.bearing = geoVal(data.bearing);
       try { await api('POST', '/api/cameras', data); e.target.reset(); showMsg('#cam-msg', 'Camera added.'); refresh(); }
       catch (err) { showMsg('#cam-msg', err.message, true); }
     });
@@ -1631,6 +1975,9 @@ INDEX_HTML = """<!doctype html>
       $('#edit-tlsVerify').value = cam.tlsVerify ? 'true' : 'false';
       $('#edit-record').value = cam.record ? 'true' : 'false';
       $('#edit-retainHours').value = cam.retainHours || 168;
+      $('#edit-lat').value = geoStr(cam.lat);
+      $('#edit-lon').value = geoStr(cam.lon);
+      $('#edit-bearing').value = geoStr(cam.bearing);
       $('#edit-enabled').value = cam.enabled ? 'true' : 'false';
       $('#edit-msg').innerHTML = '';
       $('#edit-overlay').hidden = false;
@@ -1689,6 +2036,9 @@ INDEX_HTML = """<!doctype html>
         tlsVerify: $('#edit-tlsVerify').value === 'true',
         record: $('#edit-record').value === 'true',
         retainHours: Number($('#edit-retainHours').value),
+        lat: geoVal($('#edit-lat').value),
+        lon: geoVal($('#edit-lon').value),
+        bearing: geoVal($('#edit-bearing').value),
         enabled: $('#edit-enabled').value === 'true',
       };
       try {
