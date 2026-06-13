@@ -52,8 +52,16 @@ on demand. **The cloud is master**: it owns mediamtx path generation.
   "site": "site1",
   "tailnetHost": "100.86.38.62",
   "cameras": [
-    { "slug": "front-door", "label": "Front Door" },
-    { "slug": "parking",    "label": "Parking Lot" }
+    { "slug": "front-door", "label": "Front Door",
+      "sourceOnDemand": true,
+      "sourceOnDemandStartTimeout": "15s",
+      "sourceOnDemandCloseAfter": "30s",
+      "rtspTransport": "tcp" },
+    { "slug": "parking", "label": "Parking Lot",
+      "sourceOnDemand": true,
+      "sourceOnDemandStartTimeout": "15s",
+      "sourceOnDemandCloseAfter": "30s",
+      "rtspTransport": "tcp" }
   ]
 }
 ```
@@ -61,8 +69,17 @@ on demand. **The cloud is master**: it owns mediamtx path generation.
 - `site` — the site slug; namespaces all of this box's paths.
 - `tailnetHost` — the **box's own** tailnet IP. The cloud uses it to build the
   pull source (see below).
-- `cameras[]` — `slug` (unique within the site) and a human `label`. Only
-  enabled cameras are sent. The box guarantees slugs are unique per payload.
+- `cameras[]` — per camera:
+  - `slug` (unique within the site) and a human `label`. Only enabled cameras
+    are sent; the box guarantees slugs are unique per payload.
+  - **`sourceOnDemand`** — always `true`. The cloud must pull only when a
+    viewer is watching (this is the core "pull on demand" design). Earlier the
+    box omitted this and relied on the cloud to default it; it now states it
+    explicitly. **Honor it; do not hardcode the opposite.**
+  - `sourceOnDemandStartTimeout` / `sourceOnDemandCloseAfter` — pull timing
+    (strings like `"15s"`, `"30s"`).
+  - `rtspTransport` — always `"tcp"`. **REQUIRED** — the box mediamtx is
+    `rtspTransports: [tcp]`; UDP gets RTSP 400.
 
 ### Required semantics — **full replace per site (upsert, never append)**
 
@@ -71,15 +88,16 @@ This is what prevents duplicate/stale paths and the YAML reverts we hit before:
 1. Treat the posted `cameras[]` as the **complete, authoritative** set for
    `site`. Delete any previously-generated path for this `site` whose slug is
    **not** in the new array; upsert the rest. Leave other sites untouched.
-2. For each camera, generate a mediamtx path:
+2. For each camera, generate a mediamtx path **from the fields in the payload**
+   (do not substitute your own pull policy):
 
    ```yaml
-   <site>-<slug>:
-     source: rtsp://<tailnetHost>:8554/<slug>
-     sourceOnDemand: yes
-     sourceOnDemandStartTimeout: 15s
-     sourceOnDemandCloseAfter: 30s
-     rtspTransport: tcp        # REQUIRED — box mediamtx is rtspTransports: [tcp]
+   <site>-<slug>:                                  # from site + slug
+     source: rtsp://<tailnetHost>:8554/<slug>      # from tailnetHost + slug
+     sourceOnDemand: yes                           # from cameras[].sourceOnDemand
+     sourceOnDemandStartTimeout: 15s               # from cameras[].sourceOnDemandStartTimeout
+     sourceOnDemandCloseAfter: 30s                 # from cameras[].sourceOnDemandCloseAfter
+     rtspTransport: tcp                            # from cameras[].rtspTransport
    ```
 
    The unique key for a cloud path is **`(site, slug)`** → path name

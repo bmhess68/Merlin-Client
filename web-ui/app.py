@@ -305,11 +305,18 @@ def _mediamtx_call(method: str, path: str, body: dict | None = None,
 
 def register_cameras_with_cloud(cfg: dict) -> dict:
     """POST the box's current camera list to the cloud's admin endpoint.
-    Cloud is master — it owns mediamtx path generation. Body shape:
+    The cloud owns the path namespace and serving; the box states the pull
+    spec for each camera so the cloud renders the path verbatim. Body shape:
 
         { "site": "<slug>",
-          "tailnetHost": "<box>.<tailnet>.ts.net",
-          "cameras": [{"slug": "...", "label": "..."}, ...] }
+          "tailnetHost": "<box-tailnet-ip>",
+          "cameras": [{
+            "slug": "...", "label": "...",
+            "sourceOnDemand": true,
+            "sourceOnDemandStartTimeout": "15s",
+            "sourceOnDemandCloseAfter": "30s",
+            "rtspTransport": "tcp"
+          }, ...] }
 
     Authenticated with `x-api-key: <CONTROL_API_KEY>`. Re-posting replaces
     the cloud's saved camera list for this site.
@@ -347,6 +354,13 @@ def register_cameras_with_cloud(cfg: dict) -> dict:
         by_slug[slug] = {
             "slug": slug,
             "label": cam.get("displayName") or slug,
+            # Pull policy is fixed by the architecture (cloud pulls on demand,
+            # box mediamtx is TCP-only). Stated explicitly so the cloud renders
+            # the path verbatim instead of relying on its own defaults.
+            "sourceOnDemand": True,
+            "sourceOnDemandStartTimeout": "15s",
+            "sourceOnDemandCloseAfter": "30s",
+            "rtspTransport": "tcp",
         }
     cameras = list(by_slug.values())
 
