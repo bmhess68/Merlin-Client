@@ -11,7 +11,11 @@
 #   MERLIN_REPO       git URL of the project (default: see REPO_DEFAULT below)
 #   MERLIN_BRANCH     git branch (default: main)
 #   MERLIN_DIR        install path (default: /opt/merlin-edge)
+#   SITE_SLUG           Tailscale hostname / site slug for this box
 #   TAILSCALE_AUTH_KEY  if set, bootstrap joins the tailnet non-interactively
+#   CONTROL_API_KEY     fleet-wide x-api-key for merlin-cloud + merlin-map sync
+#   MERLINREAD_PASSWORD / MEDIAMTX_API_PASSWORD / MEDIAMTX_PLAYBACK_PASSWORD
+#                       mediamtx credentials; written to .env if it doesn't exist
 set -euo pipefail
 
 REPO_DEFAULT="https://github.com/bmhess68/Merlin-Client.git"

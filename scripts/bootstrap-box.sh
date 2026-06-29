@@ -111,6 +111,47 @@ else
   fi
 fi
 
+# --- box secrets (.env) -----------------------------------------------------
+# CONTROL_API_KEY and the mediamtx credentials are FLEET-WIDE shared secrets:
+# every box sends the same x-api-key to merlin-cloud/merlin-map, and the cloud
+# pulls/plays with the same mediamtx users. Provision a new box by passing them
+# to this script, e.g.:
+#
+#   sudo SITE_SLUG=rye-i95 TAILSCALE_AUTH_KEY=tskey-... \
+#        CONTROL_API_KEY=bb844d3d... \
+#        MERLINREAD_PASSWORD=... \
+#        MEDIAMTX_API_PASSWORD=... MEDIAMTX_PLAYBACK_PASSWORD=... \
+#        bash scripts/bootstrap-box.sh
+#
+# An existing .env is never overwritten (so re-running bootstrap is safe).
+env_file="${repo_root}/.env"
+echo
+echo "==> Box secrets (${env_file})"
+if [[ -f "${env_file}" ]]; then
+  echo "    Already exists — leaving untouched."
+else
+  umask 077
+  tmp_env="$(mktemp)"
+  for var in CONTROL_API_KEY MERLINREAD_PASSWORD MEDIAMTX_API_PASSWORD \
+             MEDIAMTX_PLAYBACK_PASSWORD MEDIAMTX_PUBLISH_PASSWORD ADMIN_PASSWORD; do
+    if [[ -n "${!var:-}" ]]; then
+      printf '%s=%s\n' "${var}" "${!var}" >> "${tmp_env}"
+    fi
+  done
+  if [[ -s "${tmp_env}" ]]; then
+    install -m 0600 "${tmp_env}" "${env_file}"
+    chown "${SUDO_USER:-root}":"${SUDO_USER:-root}" "${env_file}" 2>/dev/null || true
+    echo "    Wrote $(grep -c '=' "${env_file}") secret(s) from provided env vars."
+  else
+    cp "${repo_root}/.env.example" "${env_file}"
+    chmod 0600 "${env_file}"
+    chown "${SUDO_USER:-root}":"${SUDO_USER:-root}" "${env_file}" 2>/dev/null || true
+    echo "    No secret env vars provided — seeded from .env.example."
+    echo "    Edit ${env_file} and set CONTROL_API_KEY (+ mediamtx passwords) before syncing."
+  fi
+  rm -f "${tmp_env}"
+fi
+
 echo
 echo "Bootstrap complete."
 echo "  - Docker:    $(docker --version 2>/dev/null || echo 'not on PATH yet (re-login)')"
