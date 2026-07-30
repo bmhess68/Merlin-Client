@@ -81,6 +81,15 @@ CONTROL_API_KEY = os.environ.get("CONTROL_API_KEY", "").strip()
 
 MEDIAMTX_API = "http://mediamtx:9997/v3/config"
 
+# Disk guard: keep at least this percentage of the /data disk free at all
+# times. When free space drops below it, the reaper deletes the oldest
+# recording segments (across all cameras) until the reserve is restored, so
+# a full disk can never wedge mediamtx or the host.
+DISK_RESERVE_PERCENT = float(os.environ.get("DISK_RESERVE_PERCENT", "5") or 5)
+REAPER_INTERVAL_SECONDS = 60
+# Segments younger than this are never reaped — mediamtx may still be writing them.
+REAPER_MIN_AGE_SECONDS = 120
+
 
 # --- config + validation -----------------------------------------------------
 
@@ -890,6 +899,142 @@ def recordings_summary() -> dict:
     return {"totalBytes": total, "perCamera": per_cam}
 
 
+def storage_plan(cfg: dict, disk: dict | None, rec: dict) -> dict:
+    """Project steady-state recording usage (cameras × retention × measured
+    data rate) and compare it against what the disk can actually hold once
+    the reaper's reserve and non-recording files are subtracted."""
+    now = time.time()
+    per_cam_rec = rec.get("perCamera", {})
+    cameras = cfg.get("cameras", [])
+
+    # Measured average write rate per camera (bytes/sec), from what's on disk.
+    # Needs ≥1h of footage on disk to be meaningful.
+    rates: dict[str, float] = {}
+    for slug, info in per_cam_rec.items():
+        oldest = info.get("oldestEpoch")
+        size = info.get("sizeBytes") or 0
+        if oldest and size > 0:
+            span = now - oldest
+            if span >= 3600:
+                rates[slug] = size / span
+    measured = sorted(rates.values())
+    median_rate = measured[len(measured) // 2] if measured else None
+
+    per_camera = []
+    projected_total = 0.0
+    rate_total = 0.0
+    recording_count = 0
+    unknown_count = 0
+    for cam in cameras:
+        slug = cam.get("slug", "")
+        recording = bool(cam.get("record")) and bool(cam.get("enabled", True))
+        retain_h = int(cam.get("retainHours") or 0)
+        rate = rates.get(slug)
+        estimated = False
+        if recording and rate is None:
+            # No footage yet — assume it writes like the median camera.
+            rate = median_rate
+            estimated = rate is not None
+            if rate is None:
+                unknown_count += 1
+        projected = (rate * retain_h * 3600) if (recording and rate) else 0.0
+        if recording:
+            recording_count += 1
+            rate_total += rate or 0.0
+        projected_total += projected
+        per_camera.append({
+            "slug": slug,
+            "recording": recording,
+            "retainHours": retain_h,
+            "bytesPerDay": round(rate * 86400) if rate else None,
+            "projectedBytes": round(projected),
+            "estimated": estimated,
+        })
+
+    out = {
+        "reservePercent": DISK_RESERVE_PERCENT,
+        "recordingCameras": recording_count,
+        "totalCameras": len(cameras),
+        "unknownRateCameras": unknown_count,
+        "ingestBytesPerDay": round(rate_total * 86400),
+        "projectedBytes": round(projected_total),
+        "perCamera": per_camera,
+    }
+    if disk:
+        total = disk["totalBytes"]
+        other_used = max(0, (total - disk["freeBytes"]) - (rec.get("totalBytes") or 0))
+        capacity = max(0.0, total * (1 - DISK_RESERVE_PERCENT / 100.0) - other_used)
+        out["diskTotalBytes"] = total
+        out["otherUsedBytes"] = other_used
+        out["capacityBytes"] = round(capacity)
+        out["overCapacity"] = projected_total > capacity
+        out["usagePercentOfCapacity"] = round(100.0 * projected_total / capacity, 1) if capacity > 0 else None
+    return out
+
+
+# --- disk reaper ---------------------------------------------------------------
+# Safety net so a full disk can never lock the box: whatever the per-camera
+# retention says, if free space falls below DISK_RESERVE_PERCENT the oldest
+# recording segments are deleted (globally oldest-first) until it recovers.
+
+def _reap_once() -> None:
+    try:
+        usage = shutil.disk_usage(DATA_DIR)
+    except OSError:
+        return
+    target_free = usage.total * DISK_RESERVE_PERCENT / 100.0
+    if usage.free >= target_free or not RECORDINGS_ROOT.exists():
+        return
+    need = target_free - usage.free
+
+    now = time.time()
+    candidates: list[tuple[float, int, Path]] = []
+    try:
+        for slug_dir in RECORDINGS_ROOT.iterdir():
+            if not slug_dir.is_dir():
+                continue
+            for f in slug_dir.iterdir():
+                if not f.is_file():
+                    continue
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                if now - st.st_mtime < REAPER_MIN_AGE_SECONDS:
+                    continue
+                candidates.append((st.st_mtime, st.st_size, f))
+    except OSError:
+        return
+    candidates.sort(key=lambda c: c[0])
+
+    freed = 0
+    deleted = 0
+    for _, size, f in candidates:
+        if freed >= need:
+            break
+        try:
+            f.unlink()
+        except OSError:
+            continue
+        freed += size
+        deleted += 1
+    print(
+        f"disk reaper: free space {usage.free / 1e9:.1f} GB fell below the "
+        f"{DISK_RESERVE_PERCENT:g}% reserve ({target_free / 1e9:.1f} GB) — "
+        f"deleted {deleted} oldest segment(s), freed {freed / 1e9:.2f} GB",
+        flush=True,
+    )
+
+
+def _disk_reaper_loop() -> None:
+    while True:
+        try:
+            _reap_once()
+        except Exception as exc:  # noqa: BLE001
+            print(f"disk reaper error: {exc}", flush=True)
+        time.sleep(REAPER_INTERVAL_SECONDS)
+
+
 # --- compose service inspection + log tail ----------------------------------
 
 COMPOSE_PROJECT = "merlin-edge"
@@ -1168,6 +1313,8 @@ def _cloud_health_loop() -> None:
 
 
 def build_health(cfg: dict) -> dict:
+    disk = disk_stats()
+    rec = recordings_summary()
     return {
         "site": cfg["site"]["slug"],
         "tailnetHost": cfg["cloud"].get("tailnetHost", ""),
@@ -1177,10 +1324,11 @@ def build_health(cfg: dict) -> dict:
         "host": {
             "cpuPercent": host_cpu_percent(),
             "memory": host_memory(),
-            "disk": disk_stats(),
+            "disk": disk,
             "networkOutMbps": host_network_mbps(),
-            "recordings": recordings_summary(),
+            "recordings": rec,
         },
+        "storagePlan": storage_plan(cfg, disk, rec),
         "reportedAt": int(time.time()),
     }
 
@@ -1309,7 +1457,34 @@ def api_delete_camera(slug: str):
         return jsonify({"error": "camera not found"}), 404
     cfg["cameras"] = new_cams
     save_config(cfg)
-    return jsonify({"saved": True, "urls": stream_urls(cfg)})
+
+    # ?recordings=1 (set by the UI's confirm dialog) also purges the camera's
+    # footage and snapshot. Only reached for a slug that existed in config,
+    # so the path is a validated slug — safe to rmtree.
+    recordings_deleted = False
+    freed = 0
+    if request.args.get("recordings") in ("1", "true", "yes"):
+        rec_dir = RECORDINGS_ROOT / slug
+        if rec_dir.is_dir():
+            for f in rec_dir.rglob("*"):
+                try:
+                    if f.is_file():
+                        freed += f.stat().st_size
+                except OSError:
+                    continue
+            shutil.rmtree(rec_dir, ignore_errors=True)
+            recordings_deleted = True
+        thumb = THUMBNAILS_ROOT / f"{slug}.jpg"
+        try:
+            thumb.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return jsonify({
+        "saved": True,
+        "urls": stream_urls(cfg),
+        "recordingsDeleted": recordings_deleted,
+        "freedBytes": freed,
+    })
 
 
 @app.get("/api/health")
@@ -1573,6 +1748,23 @@ INDEX_HTML = """<!doctype html>
       </div>
     </div>
 
+    <div id="del-overlay" class="modal-overlay" hidden>
+      <div class="modal">
+        <h2>Delete camera <span id="del-title" class="mono"></span></h2>
+        <p class="small">This removes the camera from this box and from mediamtx. It does not touch the cloud until your next sync.</p>
+        <div id="del-info" class="small" style="margin-bottom:10px"></div>
+        <label style="display:flex;gap:8px;align-items:center;font-weight:400;font-size:14px;margin-bottom:14px">
+          <input type="checkbox" id="del-recordings" checked>
+          <span>Also delete its recordings from disk (<span id="del-rec-size">…</span>)</span>
+        </label>
+        <div class="actions">
+          <button class="danger" id="del-go">Delete camera</button>
+          <button type="button" class="ghost" id="del-cancel">Cancel</button>
+        </div>
+        <div id="del-msg"></div>
+      </div>
+    </div>
+
     <div id="lightbox" class="lightbox" hidden></div>
 
     <div class="grid2">
@@ -1664,6 +1856,11 @@ INDEX_HTML = """<!doctype html>
         <div class="card">
           <h2>Host</h2>
           <div id="host"></div>
+        </div>
+
+        <div class="card">
+          <h2>Storage plan</h2>
+          <div id="storage" class="small">…</div>
         </div>
       </div>
     </div>
@@ -1803,6 +2000,44 @@ INDEX_HTML = """<!doctype html>
       `;
     }
 
+    function renderStorage(plan) {
+      const el = $('#storage');
+      if (!plan) { el.textContent = '…'; return; }
+      const cap = plan.capacityBytes;
+      const proj = plan.projectedBytes;
+      const pct = plan.usagePercentOfCapacity;
+      let pillHtml, msg = '';
+      if (plan.overCapacity) {
+        pillHtml = '<span class="pill bad">over capacity</span>';
+        msg = '<div class="toast err" style="margin-top:10px"><strong>Scheduled recordings exceed this disk.</strong> '
+            + plan.recordingCameras + ' camera(s) at their current retention project to ' + fmtBytes(proj)
+            + ', but only ' + fmtBytes(cap) + ' is available for recordings. Lower retention hours or record fewer cameras — '
+            + 'otherwise the disk guard will delete the oldest footage early and actual retention will be shorter than configured.</div>';
+      } else if (pct != null && pct > 85) {
+        pillHtml = '<span class="pill warn">tight fit</span>';
+        msg = '<div class="toast warn" style="margin-top:10px">Projected recordings use ' + pct
+            + '% of available space — little headroom for bitrate spikes.</div>';
+      } else {
+        pillHtml = '<span class="pill ok">fits on disk</span>';
+      }
+      const bar = (cap && cap > 0)
+        ? '<div class="bar ' + ((plan.overCapacity || pct > 85) ? 'warn' : '') + '"><span style="width:' + Math.min(100, pct || 0) + '%"></span></div>'
+        : '';
+      const est = plan.unknownRateCameras
+        ? '<div class="small" style="margin-top:6px">' + plan.unknownRateCameras
+          + ' camera(s) have no footage yet — their data rate is unknown and not counted.</div>'
+        : '';
+      el.innerHTML = `
+        <div class="stat"><span>Verdict</span><span class="v">${pillHtml}</span></div>
+        <div class="stat"><span>Cameras recording</span><span class="v">${plan.recordingCameras} of ${plan.totalCameras}</span></div>
+        <div class="stat"><span>Measured ingest</span><span class="v">${fmtBytes(plan.ingestBytesPerDay)}/day</span></div>
+        <div class="stat"><span>Projected at set retention</span><span class="v">${fmtBytes(proj)}${pct != null ? ' ('+pct+'%)' : ''}</span></div>
+        <div class="stat"><span>Available for recordings</span><span class="v">${cap != null ? fmtBytes(cap) : '…'}</span></div>${bar}
+        ${msg}${est}
+        <div class="small" style="margin-top:10px;opacity:.75">Disk guard: if free space drops below ${plan.reservePercent}%, the oldest recording segments are deleted automatically (checked every 60&nbsp;s) so a full disk can never lock the box.</div>
+      `;
+    }
+
     function setIfNotFocused(id, value) {
       const el = document.getElementById(id);
       if (el && document.activeElement !== el) el.value = value;
@@ -1834,6 +2069,7 @@ INDEX_HTML = """<!doctype html>
       const supCams = (health.supervisor && health.supervisor.cameras) || [];
       for (const s of supCams) statusByCam[s.slug] = s;
       const recPerCam = (health.host && health.host.recordings && health.host.recordings.perCamera) || {};
+      _lastRecPerCam = recPerCam;
 
       setIfNotFocused('site-slug', cfg.config.site.slug);
       setIfNotFocused('site-display', cfg.config.site.displayName);
@@ -1851,6 +2087,7 @@ INDEX_HTML = """<!doctype html>
 
       renderCameras(cfg.config.cameras, cfg.urls, statusByCam, recPerCam);
       renderHost(health);
+      renderStorage(health.storagePlan);
     }
 
     $('#site-form').addEventListener('submit', async (e) => {
@@ -1999,8 +2236,8 @@ INDEX_HTML = """<!doctype html>
       const act = target.dataset.act;
       try {
         if (act === 'del') {
-          if (!confirm('Delete camera "'+slug+'"?')) return;
-          await api('DELETE', '/api/cameras/'+slug);
+          openDelete(slug, _lastRecPerCam[slug]);
+          return;
         } else if (act === 'toggle') {
           const cfg = await api('GET', '/api/config');
           const cam = cfg.config.cameras.find(c => c.slug === slug);
@@ -2022,6 +2259,41 @@ INDEX_HTML = """<!doctype html>
         refresh();
       } catch (err) {
         showMsg('#cam-msg', err.message, true);
+      }
+    });
+
+    let _lastRecPerCam = {};
+    let _delSlug = null;
+    function openDelete(slug, rec) {
+      _delSlug = slug;
+      $('#del-title').textContent = slug;
+      const files = rec ? rec.fileCount : 0;
+      const size = rec ? rec.sizeBytes : 0;
+      $('#del-info').innerHTML = files
+        ? 'On disk right now: <strong>' + files + ' recording file(s), ' + fmtBytes(size) + '</strong>.'
+        : 'No recordings on disk for this camera.';
+      $('#del-rec-size').textContent = fmtBytes(size);
+      $('#del-recordings').checked = true;
+      $('#del-msg').innerHTML = '';
+      $('#del-overlay').hidden = false;
+    }
+    function closeDelete() { $('#del-overlay').hidden = true; _delSlug = null; }
+    $('#del-cancel').addEventListener('click', closeDelete);
+    $('#del-go').addEventListener('click', async () => {
+      if (!_delSlug) return;
+      const purge = $('#del-recordings').checked ? 1 : 0;
+      const btn = $('#del-go');
+      btn.disabled = true;
+      try {
+        const r = await api('DELETE', '/api/cameras/' + _delSlug + '?recordings=' + purge);
+        closeDelete();
+        showMsg('#cam-msg', 'Camera deleted.'
+          + (r.recordingsDeleted ? ' Freed ' + fmtBytes(r.freedBytes) + ' of recordings.' : ''));
+        refresh();
+      } catch (err) {
+        $('#del-msg').innerHTML = '<div class="toast err" style="margin-top:8px">' + err.message + '</div>';
+      } finally {
+        btn.disabled = false;
       }
     });
 
@@ -2110,8 +2382,14 @@ def _start_health_thread() -> None:
     t.start()
 
 
+def _start_reaper_thread() -> None:
+    t = threading.Thread(target=_disk_reaper_loop, daemon=True)
+    t.start()
+
+
 if __name__ == "__main__":
     cfg = load_config()
     save_config(cfg, write_mediamtx=True)
     _start_health_thread()
+    _start_reaper_thread()
     app.run(host="0.0.0.0", port=8080)
