@@ -47,7 +47,7 @@ DEFAULT_CONFIG = {
         "tlsVerify": False,
         "logLevel": "warning",
         "record": True,
-        "retainHours": 168,
+        "retainHours": 8,
     },
     "cameras": [],
 }
@@ -677,7 +677,7 @@ def validate_camera(payload: dict, conflicting_slugs: set[str]) -> dict:
         if log_level not in VALID_LOG_LEVELS:
             raise ValueError(f"logLevel '{log_level}' is invalid (allowed: {', '.join(sorted(VALID_LOG_LEVELS))})")
     try:
-        retain_hours = int(payload.get("retainHours", 168))
+        retain_hours = int(payload.get("retainHours", 8))
     except (TypeError, ValueError) as exc:
         raise ValueError("retainHours must be a number") from exc
     if retain_hours < 1:
@@ -1792,7 +1792,7 @@ INDEX_HTML = """<!doctype html>
               <div><label>Record locally</label>
                 <select name="record"><option value="true">yes</option><option value="false">no</option></select>
               </div>
-              <div><label>Retain hours</label><input type="number" name="retainHours" value="168" min="1"></div>
+              <div><label>Retain hours</label><input type="number" name="retainHours" value="8" min="1"></div>
               <div><label>Latitude</label><input type="number" name="lat" step="any" min="-90" max="90" placeholder="42.6526"></div>
               <div><label>Longitude</label><input type="number" name="lon" step="any" min="-180" max="180" placeholder="-73.7562"></div>
               <div><label>Heading °</label><input type="number" name="bearing" step="any" min="0" max="360" placeholder="0">
@@ -2211,7 +2211,7 @@ INDEX_HTML = """<!doctype html>
       $('#edit-rtspTransport').value = cam.rtspTransport || 'tcp';
       $('#edit-tlsVerify').value = cam.tlsVerify ? 'true' : 'false';
       $('#edit-record').value = cam.record ? 'true' : 'false';
-      $('#edit-retainHours').value = cam.retainHours || 168;
+      $('#edit-retainHours').value = cam.retainHours || 8;
       $('#edit-lat').value = geoStr(cam.lat);
       $('#edit-lon').value = geoStr(cam.lon);
       $('#edit-bearing').value = geoStr(cam.bearing);
